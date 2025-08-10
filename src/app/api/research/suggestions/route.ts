@@ -29,7 +29,7 @@ export async function POST(request: Request) {
       console.log(`🔍 Processing request for artist: ${body.artist}`);
       
       // Utiliser le vrai orchestrateur API
-      const { createAPIOrchestrator } = await import('@/lib/apis/api-orchestrator-real');
+      const { createAPIOrchestrator } = await import('@/lib/apis/api-orchestrator');
       const orchestrator = createAPIOrchestrator();
       
       let suggestions: ArtistSuggestion[] = [];

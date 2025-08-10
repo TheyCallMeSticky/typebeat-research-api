@@ -1,70 +1,82 @@
-// Client pour Last.fm API
+// Client Last.fm API - VRAIES APIs COMPLÈTES
+// Documentation: https://www.last.fm/api
 
 import axios, { AxiosInstance } from 'axios';
-import { LastFmArtist } from '@/types/artist';
-import { externalAPIs } from '@/lib/config';
 
-export interface LastFmSimilarArtistsResponse {
+interface LastFmArtist {
+  name: string;
+  mbid?: string;
+  url: string;
+  image: Array<{
+    '#text': string;
+    size: 'small' | 'medium' | 'large' | 'extralarge' | 'mega';
+  }>;
+  streamable: string;
+  ontour?: string;
+  stats?: {
+    listeners: string;
+    playcount: string;
+  };
+  similar?: {
+    artist: LastFmSimilarArtist[];
+  };
+  tags?: {
+    tag: Array<{
+      name: string;
+      url: string;
+    }>;
+  };
+  bio?: {
+    published: string;
+    summary: string;
+    content: string;
+  };
+}
+
+interface LastFmSimilarArtist {
+  name: string;
+  url: string;
+  image: Array<{
+    '#text': string;
+    size: string;
+  }>;
+  match: string; // Score de similarité (0-1)
+}
+
+interface LastFmSearchResponse {
+  results: {
+    'opensearch:Query': {
+      '#text': string;
+      role: string;
+      searchTerms: string;
+      startPage: string;
+    };
+    'opensearch:totalResults': string;
+    'opensearch:startIndex': string;
+    'opensearch:itemsPerPage': string;
+    artistmatches: {
+      artist: LastFmArtist[];
+    };
+    '@attr': {
+      for: string;
+    };
+  };
+}
+
+interface LastFmArtistInfoResponse {
+  artist: LastFmArtist;
+}
+
+interface LastFmSimilarArtistsResponse {
   similarartists: {
-    artist: LastFmArtistItem[];
+    artist: LastFmSimilarArtist[];
     '@attr': {
       artist: string;
     };
   };
 }
 
-export interface LastFmArtistItem {
-  name: string;
-  mbid: string;
-  match: string; // Score de similarité en string (ex: "0.85")
-  url: string;
-  image: Array<{
-    '#text': string;
-    size: 'small' | 'medium' | 'large' | 'extralarge' | 'mega';
-  }>;
-  streamable: string; // "0" ou "1"
-}
-
-export interface LastFmArtistInfoResponse {
-  artist: {
-    name: string;
-    mbid: string;
-    url: string;
-    image: Array<{
-      '#text': string;
-      size: 'small' | 'medium' | 'large' | 'extralarge' | 'mega';
-    }>;
-    streamable: string;
-    ontour: string;
-    stats: {
-      listeners: string;
-      playcount: string;
-    };
-    similar: {
-      artist: LastFmArtistItem[];
-    };
-    tags: {
-      tag: Array<{
-        name: string;
-        url: string;
-      }>;
-    };
-    bio: {
-      links: {
-        link: {
-          '#text': string;
-          rel: string;
-          href: string;
-        };
-      };
-      published: string;
-      summary: string;
-      content: string;
-    };
-  };
-}
-
-export interface LastFmTopTagsResponse {
+interface LastFmTopTagsResponse {
   toptags: {
     tag: Array<{
       name: string;
@@ -77,28 +89,52 @@ export interface LastFmTopTagsResponse {
   };
 }
 
+interface SimilarArtistLastFm {
+  name: string;
+  similarity_score: number;
+  listeners: number;
+  playcount: number;
+  tags: string[];
+  source: 'lastfm';
+  url: string;
+}
+
+/**
+ * CLIENT LAST.FM API - IMPLÉMENTATION COMPLÈTE
+ * 
+ * HYPOTHÈSES BASÉES SUR LA DOCUMENTATION OFFICIELLE:
+ * 1. Rate limiting: 5 requêtes par seconde par clé API
+ * 2. Format JSON avec structure spécifique (opensearch, @attr)
+ * 3. artist.search retourne jusqu'à 50 résultats par page
+ * 4. artist.getSimilar retourne jusqu'à 100 artistes similaires
+ * 5. Match score dans getSimilar va de 0 à 1 (1 = très similaire)
+ * 6. Statistiques (listeners, playcount) en format string
+ */
 export class LastFmClient {
   private client: AxiosInstance;
-  private apiKey: string;
   private requestCount: number = 0;
-  private lastRequestTime: number = 0;
-  private requestTimes: number[] = [];
+  private lastResetTime: number = Date.now();
+  private readonly RATE_LIMIT = 5; // Requêtes par seconde
+  private requestQueue: Array<() => Promise<any>> = [];
+  private isProcessingQueue: boolean = false;
 
-  constructor(apiKey: string) {
-    this.apiKey = apiKey;
-
+  constructor() {
     this.client = axios.create({
-      baseURL: externalAPIs.lastfm.baseURL,
-      timeout: 10000,
+      baseURL: 'https://ws.audioscrobbler.com/2.0',
+      timeout: 30000,
       headers: {
         'Accept': 'application/json',
         'User-Agent': 'TypeBeat-Research-API/1.0'
       }
     });
 
-    // Intercepteur pour le rate limiting
-    this.client.interceptors.request.use(async (config) => {
-      await this.checkRateLimit();
+    // Intercepteur pour ajouter les paramètres communs
+    this.client.interceptors.request.use((config) => {
+      config.params = {
+        ...config.params,
+        api_key: process.env.LASTFM_API_KEY,
+        format: 'json'
+      };
       return config;
     });
 
@@ -106,14 +142,11 @@ export class LastFmClient {
     this.client.interceptors.response.use(
       (response) => response,
       (error) => {
+        if (error.response?.status === 403) {
+          throw new Error('Last.fm API key invalid or rate limit exceeded');
+        }
         if (error.response?.status === 429) {
-          console.log('⏳ Last.fm rate limit hit, waiting...');
-          // Last.fm ne fournit pas toujours de header Retry-After
-          return new Promise(resolve => {
-            setTimeout(() => {
-              resolve(this.client.request(error.config));
-            }, 1000);
-          });
+          throw new Error('Last.fm rate limit exceeded');
         }
         throw error;
       }
@@ -121,306 +154,311 @@ export class LastFmClient {
   }
 
   /**
-   * Récupère les artistes similaires avec scores de similarité
+   * GESTION DU RATE LIMITING (5 REQ/SEC)
+   * HYPOTHÈSE: Last.fm limite à 5 requêtes par seconde
+   * IMPLÉMENTATION: Queue avec délai automatique
    */
-  async getSimilarArtists(artistName: string, limit: number = 20): Promise<{
-    similarArtists: LastFmArtist[];
-    sourceArtist: string;
-  }> {
-    try {
-      console.log(`🔍 Getting Last.fm similar artists for: "${artistName}"`);
-      
-      const response = await this.client.get<LastFmSimilarArtistsResponse>('', {
-        params: {
-          method: 'artist.getsimilar',
-          artist: artistName,
-          api_key: this.apiKey,
-          format: 'json',
-          limit: Math.min(limit, 100)
+  private async makeRateLimitedRequest<T>(requestFn: () => Promise<T>): Promise<T> {
+    return new Promise((resolve, reject) => {
+      this.requestQueue.push(async () => {
+        try {
+          const result = await requestFn();
+          resolve(result);
+        } catch (error) {
+          reject(error);
         }
       });
 
-      if (!response.data.similarartists?.artist) {
-        console.log(`⚠️ No similar artists found for "${artistName}"`);
-        return {
-          similarArtists: [],
-          sourceArtist: artistName
-        };
+      if (!this.isProcessingQueue) {
+        this.processQueue();
       }
-
-      const similarArtists = response.data.similarartists.artist.map(this.convertToInternalFormat);
-      
-      console.log(`✅ Found ${similarArtists.length} similar artists on Last.fm`);
-      
-      return {
-        similarArtists,
-        sourceArtist: response.data.similarartists['@attr'].artist
-      };
-
-    } catch (error) {
-      console.error(`❌ Last.fm similar artists error for "${artistName}":`, error);
-      throw new Error(`Last.fm similar artists failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
-    }
+    });
   }
 
-  /**
-   * Récupère les informations détaillées d'un artiste
-   */
-  async getArtistInfo(artistName: string): Promise<{
-    artist: LastFmArtist;
-    tags: string[];
-    stats: { listeners: number; playcount: number };
-    bio: string;
-  } | null> {
-    try {
-      console.log(`📋 Getting Last.fm artist info for: "${artistName}"`);
-      
-      const response = await this.client.get<LastFmArtistInfoResponse>('', {
-        params: {
-          method: 'artist.getinfo',
-          artist: artistName,
-          api_key: this.apiKey,
-          format: 'json'
-        }
-      });
+  private async processQueue(): Promise<void> {
+    this.isProcessingQueue = true;
 
-      if (!response.data.artist) {
-        return null;
+    while (this.requestQueue.length > 0) {
+      const request = this.requestQueue.shift();
+      if (request) {
+        await request();
+        
+        // Attendre 200ms entre les requêtes (5 req/sec max)
+        await new Promise(resolve => setTimeout(resolve, 200));
       }
-
-      const artistData = response.data.artist;
-      
-      const artist = this.convertToInternalFormat({
-        name: artistData.name,
-        mbid: artistData.mbid,
-        match: '1.0', // Score parfait pour l'artiste lui-même
-        url: artistData.url,
-        image: artistData.image,
-        streamable: artistData.streamable
-      });
-
-      const tags = artistData.tags?.tag?.map(tag => tag.name) || [];
-      
-      const stats = {
-        listeners: parseInt(artistData.stats.listeners) || 0,
-        playcount: parseInt(artistData.stats.playcount) || 0
-      };
-
-      const bio = artistData.bio?.summary || '';
-
-      return {
-        artist,
-        tags,
-        stats,
-        bio
-      };
-
-    } catch (error) {
-      console.error(`❌ Last.fm artist info error for "${artistName}":`, error);
-      return null;
     }
+
+    this.isProcessingQueue = false;
   }
 
   /**
-   * Récupère les tags principaux d'un artiste
+   * RECHERCHE D'ARTISTES LAST.FM
+   * HYPOTHÈSE: artist.search retourne des artistes pertinents
+   * FORMAT ATTENDU: { results: { artistmatches: { artist: LastFmArtist[] } } }
+   * INFÉRENCE: Résultats triés par pertinence
    */
-  async getArtistTags(artistName: string, limit: number = 10): Promise<Array<{
-    name: string;
-    count: number;
-    url: string;
-  }>> {
-    try {
-      const response = await this.client.get<LastFmTopTagsResponse>('', {
-        params: {
-          method: 'artist.gettoptags',
-          artist: artistName,
-          api_key: this.apiKey,
-          format: 'json'
-        }
-      });
+  async searchArtists(query: string, limit: number = 30): Promise<LastFmArtist[]> {
+    return this.makeRateLimitedRequest(async () => {
+      try {
+        console.log(`🔍 Last.fm Search: "${query}" (${limit} results)`);
+        
+        const response = await this.client.get<LastFmSearchResponse>('/', {
+          params: {
+            method: 'artist.search',
+            artist: query,
+            limit: Math.min(limit, 50) // Limite API Last.fm
+          }
+        });
 
-      if (!response.data.toptags?.tag) {
-        return [];
+        const artists = response.data.results?.artistmatches?.artist || [];
+        console.log(`✅ Found ${artists.length} artists for "${query}"`);
+        
+        return Array.isArray(artists) ? artists : [artists]; // Gérer le cas d'un seul résultat
+      } catch (error) {
+        console.error(`❌ Last.fm search failed for "${query}":`, error);
+        throw new Error(`Last.fm search failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
       }
-
-      return response.data.toptags.tag
-        .slice(0, limit)
-        .map(tag => ({
-          name: tag.name,
-          count: tag.count,
-          url: tag.url
-        }));
-
-    } catch (error) {
-      console.error(`❌ Last.fm tags error for "${artistName}":`, error);
-      return [];
-    }
+    });
   }
 
   /**
-   * Recherche d'artistes par nom
+   * OBTENIR LES INFORMATIONS DÉTAILLÉES D'UN ARTISTE
+   * HYPOTHÈSE: artist.getInfo retourne stats complètes (listeners, playcount)
+   * FORMAT ATTENDU: { artist: { stats: { listeners, playcount }, tags, bio } }
+   * INFÉRENCE: Statistiques en format string, conversion nécessaire
    */
-  async searchArtists(query: string, limit: number = 20): Promise<LastFmArtist[]> {
-    try {
-      console.log(`🔍 Searching Last.fm for: "${query}"`);
-      
-      const response = await this.client.get('', {
-        params: {
-          method: 'artist.search',
-          artist: query,
-          api_key: this.apiKey,
-          format: 'json',
-          limit: Math.min(limit, 50)
-        }
-      });
+  async getArtistInfo(artistName: string): Promise<LastFmArtist> {
+    return this.makeRateLimitedRequest(async () => {
+      try {
+        console.log(`📊 Getting Last.fm info for: ${artistName}`);
+        
+        const response = await this.client.get<LastFmArtistInfoResponse>('/', {
+          params: {
+            method: 'artist.getInfo',
+            artist: artistName,
+            autocorrect: 1 // Correction automatique des noms
+          }
+        });
 
-      const artists = response.data.results?.artistmatches?.artist || [];
-      
-      if (!Array.isArray(artists)) {
-        return [];
+        console.log(`✅ Retrieved info for ${artistName}`);
+        return response.data.artist;
+      } catch (error) {
+        console.error(`❌ Failed to get Last.fm info for ${artistName}:`, error);
+        throw new Error(`Failed to get artist info: ${error instanceof Error ? error.message : 'Unknown error'}`);
       }
-
-      const convertedArtists = artists.map((artist: any) => 
-        this.convertToInternalFormat({
-          name: artist.name,
-          mbid: artist.mbid || '',
-          match: '0.5', // Score par défaut pour les résultats de recherche
-          url: artist.url,
-          image: artist.image || [],
-          streamable: artist.streamable || '0'
-        })
-      );
-
-      console.log(`✅ Found ${convertedArtists.length} artists on Last.fm`);
-      
-      return convertedArtists;
-
-    } catch (error) {
-      console.error(`❌ Last.fm search error for "${query}":`, error);
-      return [];
-    }
+    });
   }
 
   /**
-   * Analyse complète d'un artiste (info + similaires + tags)
+   * OBTENIR LES ARTISTES SIMILAIRES
+   * HYPOTHÈSE: artist.getSimilar retourne jusqu'à 100 artistes avec scores
+   * FORMAT ATTENDU: { similarartists: { artist: [{ name, match }] } }
+   * INFÉRENCE: Match score de 0 à 1 (string), conversion en number nécessaire
    */
-  async analyzeArtist(artistName: string): Promise<{
-    artistInfo: LastFmArtist | null;
-    similarArtists: LastFmArtist[];
-    tags: string[];
-    stats: { listeners: number; playcount: number } | null;
-  }> {
-    try {
-      // Récupération en parallèle des différentes données
-      const [artistInfoResult, similarArtistsResult, tagsResult] = await Promise.allSettled([
-        this.getArtistInfo(artistName),
-        this.getSimilarArtists(artistName, 20),
-        this.getArtistTags(artistName, 15)
-      ]);
+  async getSimilarArtists(artistName: string, limit: number = 50): Promise<LastFmSimilarArtist[]> {
+    return this.makeRateLimitedRequest(async () => {
+      try {
+        console.log(`🎯 Getting similar artists for: ${artistName} (${limit} results)`);
+        
+        const response = await this.client.get<LastFmSimilarArtistsResponse>('/', {
+          params: {
+            method: 'artist.getSimilar',
+            artist: artistName,
+            limit: Math.min(limit, 100), // Limite API Last.fm
+            autocorrect: 1
+          }
+        });
 
-      const artistInfo = artistInfoResult.status === 'fulfilled' ? artistInfoResult.value : null;
-      const similarArtists = similarArtistsResult.status === 'fulfilled' ? similarArtistsResult.value.similarArtists : [];
-      const tags = tagsResult.status === 'fulfilled' ? tagsResult.value.map(tag => tag.name) : [];
-
-      return {
-        artistInfo: artistInfo?.artist || null,
-        similarArtists,
-        tags,
-        stats: artistInfo?.stats || null
-      };
-
-    } catch (error) {
-      console.error(`❌ Last.fm analyze artist error for "${artistName}":`, error);
-      return {
-        artistInfo: null,
-        similarArtists: [],
-        tags: [],
-        stats: null
-      };
-    }
+        const similarArtists = response.data.similarartists?.artist || [];
+        console.log(`✅ Found ${similarArtists.length} similar artists for ${artistName}`);
+        
+        return Array.isArray(similarArtists) ? similarArtists : [similarArtists];
+      } catch (error) {
+        console.error(`❌ Failed to get similar artists for ${artistName}:`, error);
+        throw new Error(`Failed to get similar artists: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      }
+    });
   }
 
   /**
-   * Gère le rate limiting (5 requêtes par seconde)
+   * OBTENIR LES TAGS PRINCIPAUX D'UN ARTISTE
+   * HYPOTHÈSE: artist.getTopTags retourne les genres/styles musicaux
+   * FORMAT ATTENDU: { toptags: { tag: [{ name, count }] } }
+   * INFÉRENCE: Tags triés par count (popularité)
    */
-  private async checkRateLimit(): Promise<void> {
-    const now = Date.now();
+  async getArtistTopTags(artistName: string): Promise<string[]> {
+    return this.makeRateLimitedRequest(async () => {
+      try {
+        console.log(`🏷️ Getting top tags for: ${artistName}`);
+        
+        const response = await this.client.get<LastFmTopTagsResponse>('/', {
+          params: {
+            method: 'artist.getTopTags',
+            artist: artistName,
+            autocorrect: 1
+          }
+        });
+
+        const tags = response.data.toptags?.tag || [];
+        const tagNames = (Array.isArray(tags) ? tags : [tags])
+          .map(tag => tag.name)
+          .slice(0, 10); // Top 10 tags
+
+        console.log(`✅ Found ${tagNames.length} tags for ${artistName}`);
+        return tagNames;
+      } catch (error) {
+        console.error(`❌ Failed to get tags for ${artistName}:`, error);
+        return []; // Retourner un tableau vide en cas d'erreur
+      }
+    });
+  }
+
+  /**
+   * RECHERCHE D'ARTISTES SIMILAIRES COMPLÈTE AVEC MÉTADONNÉES
+   * ALGORITHME:
+   * 1. Recherche de l'artiste principal
+   * 2. Obtention des artistes similaires avec scores
+   * 3. Enrichissement avec informations détaillées (stats, tags)
+   * 4. Filtrage par score de similarité minimum
+   * 5. Tri par score décroissant
+   */
+  async findSimilarArtistsWithMetadata(artistName: string, options: {
+    limit?: number;
+    minSimilarity?: number;
+    includeMetrics?: boolean;
+  } = {}): Promise<SimilarArtistLastFm[]> {
+    const { limit = 10, minSimilarity = 0.3, includeMetrics = true } = options;
     
-    // Nettoyer les requêtes anciennes (plus d'1 seconde)
-    this.requestTimes = this.requestTimes.filter(time => now - time < 1000);
-    
-    // Si on a déjà 5 requêtes dans la dernière seconde, attendre
-    if (this.requestTimes.length >= externalAPIs.lastfm.requestsPerSecond) {
-      const oldestRequest = Math.min(...this.requestTimes);
-      const waitTime = 1000 - (now - oldestRequest);
+    try {
+      console.log(`🎯 Finding similar artists to: ${artistName} (Last.fm)`);
       
-      if (waitTime > 0) {
-        console.log(`⏳ Last.fm rate limit, waiting ${waitTime}ms`);
-        await new Promise(resolve => setTimeout(resolve, waitTime));
+      // 1. Vérifier que l'artiste existe
+      try {
+        await this.getArtistInfo(artistName);
+      } catch (error) {
+        throw new Error(`Artist "${artistName}" not found on Last.fm`);
       }
+
+      // 2. Obtenir les artistes similaires
+      const similarArtists = await this.getSimilarArtists(artistName, limit * 2);
+      
+      if (similarArtists.length === 0) {
+        throw new Error(`No similar artists found for "${artistName}" on Last.fm`);
+      }
+
+      // 3. Enrichir avec métadonnées (en parallèle pour optimiser)
+      const enrichedArtists: SimilarArtistLastFm[] = [];
+      
+      for (const similarArtist of similarArtists) {
+        try {
+          const matchScore = parseFloat(similarArtist.match);
+          
+          // Filtrer par score minimum
+          if (matchScore < minSimilarity) continue;
+
+          let artistInfo: LastFmArtist | null = null;
+          let tags: string[] = [];
+
+          if (includeMetrics) {
+            try {
+              // Obtenir les infos détaillées et tags en parallèle
+              const [info, artistTags] = await Promise.all([
+                this.getArtistInfo(similarArtist.name),
+                this.getArtistTopTags(similarArtist.name)
+              ]);
+              
+              artistInfo = info;
+              tags = artistTags;
+            } catch (error) {
+              console.warn(`⚠️ Failed to get metadata for ${similarArtist.name}:`, error);
+            }
+          }
+
+          enrichedArtists.push({
+            name: similarArtist.name,
+            similarity_score: matchScore,
+            listeners: artistInfo?.stats ? parseInt(artistInfo.stats.listeners) || 0 : 0,
+            playcount: artistInfo?.stats ? parseInt(artistInfo.stats.playcount) || 0 : 0,
+            tags,
+            source: 'lastfm',
+            url: similarArtist.url
+          });
+
+        } catch (error) {
+          console.warn(`⚠️ Failed to process ${similarArtist.name}:`, error);
+          continue;
+        }
+      }
+
+      // 4. Trier par score de similarité et limiter
+      const finalResults = enrichedArtists
+        .sort((a, b) => b.similarity_score - a.similarity_score)
+        .slice(0, limit);
+
+      console.log(`✅ Found ${finalResults.length} similar artists with similarity >= ${minSimilarity}`);
+      
+      return finalResults;
+    } catch (error) {
+      console.error(`❌ Failed to find similar artists for "${artistName}":`, error);
+      throw error;
     }
-    
-    // Enregistrer cette requête
-    this.requestTimes.push(now);
   }
 
   /**
-   * Convertit les données Last.fm au format interne
+   * OBTENIR LES STATISTIQUES D'ÉCOUTE D'UN ARTISTE
+   * HYPOTHÈSE: Les stats Last.fm reflètent la popularité réelle
+   * INFÉRENCE: listeners = audience unique, playcount = écoutes totales
    */
-  private convertToInternalFormat(lastfmArtist: LastFmArtistItem): LastFmArtist {
+  async getArtistStats(artistName: string): Promise<{ listeners: number; playcount: number }> {
+    try {
+      const artistInfo = await this.getArtistInfo(artistName);
+      
+      return {
+        listeners: artistInfo.stats ? parseInt(artistInfo.stats.listeners) || 0 : 0,
+        playcount: artistInfo.stats ? parseInt(artistInfo.stats.playcount) || 0 : 0
+      };
+    } catch (error) {
+      console.warn(`⚠️ Failed to get stats for ${artistName}:`, error);
+      return { listeners: 0, playcount: 0 };
+    }
+  }
+
+  /**
+   * HEALTH CHECK
+   */
+  async healthCheck(): Promise<{ status: 'healthy' | 'unhealthy'; error?: string; rateLimit?: any }> {
+    try {
+      // Test simple avec une recherche
+      await this.searchArtists('test', 1);
+      
+      return {
+        status: 'healthy',
+        rateLimit: {
+          requestsPerSecond: this.RATE_LIMIT,
+          queueLength: this.requestQueue.length
+        }
+      };
+    } catch (error) {
+      return {
+        status: 'unhealthy',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  /**
+   * OBTENIR LES STATISTIQUES D'UTILISATION
+   */
+  getUsageStats(): { queueLength: number; rateLimit: number; isProcessing: boolean } {
     return {
-      name: lastfmArtist.name,
-      mbid: lastfmArtist.mbid || undefined,
-      match: parseFloat(lastfmArtist.match) || 0,
-      url: lastfmArtist.url,
-      image: lastfmArtist.image.map(img => ({
-        url: img['#text'],
-        size: img.size
-      })),
-      streamable: lastfmArtist.streamable === '1'
+      queueLength: this.requestQueue.length,
+      rateLimit: this.RATE_LIMIT,
+      isProcessing: this.isProcessingQueue
     };
   }
+}
 
-  /**
-   * Obtient les statistiques d'utilisation
-   */
-  getUsageStats(): {
-    requestsInLastSecond: number;
-    totalRequests: number;
-    averageRequestsPerSecond: number;
-  } {
-    const now = Date.now();
-    const recentRequests = this.requestTimes.filter(time => now - time < 1000);
-    
-    return {
-      requestsInLastSecond: recentRequests.length,
-      totalRequests: this.requestCount,
-      averageRequestsPerSecond: this.requestTimes.length
-    };
-  }
-
-  /**
-   * Calcule le score de similarité moyen pour un groupe d'artistes
-   */
-  calculateAverageSimilarity(artists: LastFmArtist[]): number {
-    if (artists.length === 0) return 0;
-    
-    const totalMatch = artists.reduce((sum, artist) => sum + artist.match, 0);
-    return totalMatch / artists.length;
-  }
-
-  /**
-   * Filtre les artistes par score de similarité minimum
-   */
-  filterBySimilarity(artists: LastFmArtist[], minScore: number = 0.3): LastFmArtist[] {
-    return artists.filter(artist => artist.match >= minScore);
-  }
-
-  /**
-   * Trie les artistes par score de similarité décroissant
-   */
-  sortBySimilarity(artists: LastFmArtist[]): LastFmArtist[] {
-    return [...artists].sort((a, b) => b.match - a.match);
-  }
+export function createLastFmClient(): LastFmClient {
+  return new LastFmClient();
 }
 

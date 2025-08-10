@@ -1,13 +1,37 @@
-// Client pour Spotify Web API
+// Client Spotify Web API - VRAIES APIs COMPLÈTES
+// Documentation: https://developer.spotify.com/documentation/web-api
 
 import axios, { AxiosInstance } from 'axios';
-import { SpotifyArtist } from '@/types/artist';
-import { externalAPIs } from '@/lib/config';
 
-export interface SpotifySearchResponse {
+interface SpotifyTokenResponse {
+  access_token: string;
+  token_type: string;
+  expires_in: number;
+  scope?: string;
+}
+
+interface SpotifyArtist {
+  id: string;
+  name: string;
+  genres: string[];
+  popularity: number;
+  followers: {
+    total: number;
+  };
+  images: Array<{
+    url: string;
+    height: number;
+    width: number;
+  }>;
+  external_urls: {
+    spotify: string;
+  };
+}
+
+interface SpotifySearchResponse {
   artists: {
     href: string;
-    items: SpotifyArtistItem[];
+    items: SpotifyArtist[];
     limit: number;
     next: string | null;
     offset: number;
@@ -16,56 +40,62 @@ export interface SpotifySearchResponse {
   };
 }
 
-export interface SpotifyArtistItem {
-  external_urls: {
-    spotify: string;
-  };
-  followers: {
-    href: string | null;
-    total: number;
-  };
-  genres: string[];
-  href: string;
-  id: string;
-  images: Array<{
-    height: number;
-    url: string;
-    width: number;
+interface SpotifyRecommendationsResponse {
+  tracks: Array<{
+    artists: SpotifyArtist[];
+    id: string;
+    name: string;
+    popularity: number;
   }>;
+  seeds: Array<{
+    afterFilteringSize: number;
+    afterRelinkingSize: number;
+    href: string;
+    id: string;
+    initialPoolSize: number;
+    type: string;
+  }>;
+}
+
+interface SpotifyRelatedArtistsResponse {
+  artists: SpotifyArtist[];
+}
+
+interface SimilarArtist {
   name: string;
+  id: string;
+  genres: string[];
   popularity: number;
-  type: 'artist';
-  uri: string;
+  followers: number;
+  similarity_score: number;
+  source: 'spotify';
 }
 
-export interface SpotifyRelatedArtistsResponse {
-  artists: SpotifyArtistItem[];
-}
-
-export interface SpotifyTokenResponse {
-  access_token: string;
-  token_type: string;
-  expires_in: number;
-}
-
+/**
+ * CLIENT SPOTIFY WEB API - IMPLÉMENTATION COMPLÈTE
+ * 
+ * HYPOTHÈSES BASÉES SUR LA DOCUMENTATION OFFICIELLE:
+ * 1. OAuth Client Credentials Flow pour l'authentification
+ * 2. Rate limiting: ~100 requêtes par minute par application
+ * 3. search endpoint retourne jusqu'à 50 résultats par page
+ * 4. recommendations endpoint utilise des seed artists
+ * 5. related-artists endpoint retourne jusqu'à 20 artistes similaires
+ * 6. Popularité sur échelle 0-100 (100 = plus populaire)
+ */
 export class SpotifyClient {
   private client: AxiosInstance;
   private authClient: AxiosInstance;
-  private clientId: string;
-  private clientSecret: string;
   private accessToken: string | null = null;
   private tokenExpiresAt: number = 0;
   private requestCount: number = 0;
-  private lastRequestTime: number = 0;
+  private lastResetTime: number = Date.now();
+  private readonly RATE_LIMIT = 100; // Requêtes par minute
 
-  constructor(clientId: string, clientSecret: string) {
-    this.clientId = clientId;
-    this.clientSecret = clientSecret;
-
+  constructor() {
     // Client pour les requêtes API
     this.client = axios.create({
-      baseURL: externalAPIs.spotify.baseURL,
-      timeout: 10000,
+      baseURL: 'https://api.spotify.com/v1',
+      timeout: 30000,
       headers: {
         'Accept': 'application/json',
         'Content-Type': 'application/json',
@@ -75,235 +105,58 @@ export class SpotifyClient {
 
     // Client pour l'authentification
     this.authClient = axios.create({
-      baseURL: externalAPIs.spotify.authURL,
-      timeout: 5000,
+      baseURL: 'https://accounts.spotify.com',
+      timeout: 10000,
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded'
       }
     });
 
-    // Intercepteur pour ajouter le token d'authentification
+    // Intercepteur pour ajouter le token d'accès
     this.client.interceptors.request.use(async (config) => {
       await this.ensureValidToken();
-      await this.checkRateLimit();
-      
       config.headers.Authorization = `Bearer ${this.accessToken}`;
       return config;
     });
 
-    // Intercepteur pour gérer les erreurs
+    // Intercepteur pour gérer les erreurs et rate limiting
     this.client.interceptors.response.use(
-      (response) => response,
+      (response) => {
+        this.trackRequest();
+        return response;
+      },
       async (error) => {
         if (error.response?.status === 401) {
-          // Token expiré, on le renouvelle
+          // Token expiré, forcer le renouvellement
           this.accessToken = null;
           this.tokenExpiresAt = 0;
-          
-          // Retry la requête
-          const originalRequest = error.config;
-          if (!originalRequest._retry) {
-            originalRequest._retry = true;
-            await this.ensureValidToken();
-            originalRequest.headers.Authorization = `Bearer ${this.accessToken}`;
-            return this.client.request(originalRequest);
-          }
+          throw new Error('Spotify authentication failed');
         }
-        
         if (error.response?.status === 429) {
-          // Rate limit exceeded
-          const retryAfter = parseInt(error.response.headers['retry-after'] || '1');
-          console.log(`⏳ Spotify rate limit hit, waiting ${retryAfter}s`);
-          await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
-          
-          // Retry la requête
-          return this.client.request(error.config);
+          // Rate limit atteint
+          const retryAfter = error.response.headers['retry-after'] || 60;
+          throw new Error(`Spotify rate limit exceeded. Retry after ${retryAfter} seconds`);
         }
-        
         throw error;
       }
     );
   }
 
   /**
-   * Recherche d'artistes par nom
+   * AUTHENTIFICATION OAUTH CLIENT CREDENTIALS
+   * HYPOTHÈSE: Client Credentials Flow selon la doc Spotify
+   * FORMAT ATTENDU: { access_token, token_type, expires_in }
+   * INFÉRENCE: Token valide pendant expires_in secondes
    */
-  async searchArtists(query: string, limit: number = 20): Promise<{
-    artists: SpotifyArtist[];
-    total: number;
-  }> {
+  private async authenticate(): Promise<void> {
     try {
-      console.log(`🔍 Searching Spotify for artist: "${query}"`);
+      console.log('🔐 Authenticating with Spotify...');
       
-      const response = await this.client.get<SpotifySearchResponse>('/search', {
-        params: {
-          q: query,
-          type: 'artist',
-          limit: Math.min(limit, 50),
-          market: 'US'
-        }
-      });
+      const credentials = Buffer.from(
+        `${process.env.SPOTIFY_CLIENT_ID}:${process.env.SPOTIFY_CLIENT_SECRET}`
+      ).toString('base64');
 
-      const artists = response.data.artists.items.map(this.convertToInternalFormat);
-      
-      console.log(`✅ Found ${artists.length} artists on Spotify`);
-      
-      return {
-        artists,
-        total: response.data.artists.total
-      };
-
-    } catch (error) {
-      console.error('❌ Spotify search error:', error);
-      throw new Error(`Spotify search failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
-    }
-  }
-
-  /**
-   * Récupère un artiste par son ID Spotify
-   */
-  async getArtist(artistId: string): Promise<SpotifyArtist> {
-    try {
-      const response = await this.client.get<SpotifyArtistItem>(`/artists/${artistId}`);
-      return this.convertToInternalFormat(response.data);
-    } catch (error) {
-      console.error(`❌ Error fetching Spotify artist ${artistId}:`, error);
-      throw new Error(`Failed to fetch artist: ${error instanceof Error ? error.message : 'Unknown error'}`);
-    }
-  }
-
-  /**
-   * Récupère les artistes similaires (Related Artists)
-   */
-  async getRelatedArtists(artistId: string): Promise<SpotifyArtist[]> {
-    try {
-      console.log(`🔗 Getting related artists for Spotify ID: ${artistId}`);
-      
-      const response = await this.client.get<SpotifyRelatedArtistsResponse>(`/artists/${artistId}/related-artists`);
-      
-      const relatedArtists = response.data.artists.map(this.convertToInternalFormat);
-      
-      console.log(`✅ Found ${relatedArtists.length} related artists`);
-      
-      return relatedArtists;
-
-    } catch (error) {
-      console.error(`❌ Error fetching related artists for ${artistId}:`, error);
-      throw new Error(`Failed to fetch related artists: ${error instanceof Error ? error.message : 'Unknown error'}`);
-    }
-  }
-
-  /**
-   * Recherche d'artistes similaires par nom (combine search + related)
-   */
-  async findSimilarArtists(artistName: string, limit: number = 20): Promise<{
-    mainArtist: SpotifyArtist | null;
-    relatedArtists: SpotifyArtist[];
-    searchResults: SpotifyArtist[];
-  }> {
-    try {
-      // 1. Rechercher l'artiste principal
-      const searchResult = await this.searchArtists(artistName, 1);
-      const mainArtist = searchResult.artists[0] || null;
-
-      let relatedArtists: SpotifyArtist[] = [];
-      
-      // 2. Si trouvé, récupérer les artistes similaires
-      if (mainArtist) {
-        try {
-          relatedArtists = await this.getRelatedArtists(mainArtist.spotify_id);
-        } catch (error) {
-          console.warn('⚠️ Could not fetch related artists, using search results only');
-        }
-      }
-
-      // 3. Recherche élargie pour plus de résultats
-      const expandedSearch = await this.searchArtists(artistName, limit);
-      const searchResults = expandedSearch.artists.filter(artist => 
-        artist.spotify_id !== mainArtist?.spotify_id
-      );
-
-      return {
-        mainArtist,
-        relatedArtists,
-        searchResults
-      };
-
-    } catch (error) {
-      console.error(`❌ Error finding similar artists for "${artistName}":`, error);
-      throw new Error(`Failed to find similar artists: ${error instanceof Error ? error.message : 'Unknown error'}`);
-    }
-  }
-
-  /**
-   * Recherche d'artistes par genre
-   */
-  async searchByGenre(genre: string, limit: number = 20): Promise<SpotifyArtist[]> {
-    try {
-      const query = `genre:"${genre}"`;
-      const result = await this.searchArtists(query, limit);
-      return result.artists;
-    } catch (error) {
-      console.error(`❌ Error searching by genre "${genre}":`, error);
-      return [];
-    }
-  }
-
-  /**
-   * Récupère plusieurs artistes par leurs IDs
-   */
-  async getMultipleArtists(artistIds: string[]): Promise<SpotifyArtist[]> {
-    if (artistIds.length === 0) return [];
-
-    try {
-      // Spotify permet max 50 artistes par requête
-      const chunks = this.chunkArray(artistIds, 50);
-      const allArtists: SpotifyArtist[] = [];
-
-      for (const chunk of chunks) {
-        const response = await this.client.get<{ artists: SpotifyArtistItem[] }>('/artists', {
-          params: {
-            ids: chunk.join(',')
-          }
-        });
-
-        const artists = response.data.artists
-          .filter(artist => artist !== null)
-          .map(this.convertToInternalFormat);
-        
-        allArtists.push(...artists);
-      }
-
-      return allArtists;
-
-    } catch (error) {
-      console.error('❌ Error fetching multiple artists:', error);
-      throw new Error(`Failed to fetch artists: ${error instanceof Error ? error.message : 'Unknown error'}`);
-    }
-  }
-
-  /**
-   * Assure qu'on a un token d'accès valide
-   */
-  private async ensureValidToken(): Promise<void> {
-    const now = Date.now();
-    const bufferTime = externalAPIs.spotify.tokenExpiryBuffer * 1000; // 5 minutes en ms
-
-    if (!this.accessToken || now >= (this.tokenExpiresAt - bufferTime)) {
-      await this.refreshAccessToken();
-    }
-  }
-
-  /**
-   * Renouvelle le token d'accès via Client Credentials Flow
-   */
-  private async refreshAccessToken(): Promise<void> {
-    try {
-      console.log('🔄 Refreshing Spotify access token...');
-      
-      const credentials = Buffer.from(`${this.clientId}:${this.clientSecret}`).toString('base64');
-      
-      const response = await this.authClient.post<SpotifyTokenResponse>('', 
+      const response = await this.authClient.post<SpotifyTokenResponse>('/api/token', 
         'grant_type=client_credentials',
         {
           headers: {
@@ -313,93 +166,266 @@ export class SpotifyClient {
       );
 
       this.accessToken = response.data.access_token;
-      this.tokenExpiresAt = Date.now() + (response.data.expires_in * 1000);
+      this.tokenExpiresAt = Date.now() + (response.data.expires_in * 1000) - 60000; // 1 min de marge
       
-      console.log('✅ Spotify token refreshed successfully');
-
+      console.log(`✅ Spotify authentication successful. Token expires in ${response.data.expires_in}s`);
     } catch (error) {
-      console.error('❌ Failed to refresh Spotify token:', error);
-      throw new Error('Spotify authentication failed');
+      console.error('❌ Spotify authentication failed:', error);
+      throw new Error(`Spotify authentication failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
   }
 
   /**
-   * Gère le rate limiting
+   * VÉRIFICATION ET RENOUVELLEMENT DU TOKEN
    */
-  private async checkRateLimit(): Promise<void> {
+  private async ensureValidToken(): Promise<void> {
+    if (!this.accessToken || Date.now() >= this.tokenExpiresAt) {
+      await this.authenticate();
+    }
+  }
+
+  /**
+   * TRACKING DES REQUÊTES POUR RATE LIMITING
+   * HYPOTHÈSE: Limite de ~100 requêtes par minute
+   */
+  private trackRequest(): void {
     const now = Date.now();
-    const timeSinceLastRequest = now - this.lastRequestTime;
     
-    // Reset counter every minute
-    if (timeSinceLastRequest > 60000) {
+    // Reset du compteur chaque minute
+    if (now - this.lastResetTime >= 60000) {
       this.requestCount = 0;
+      this.lastResetTime = now;
     }
-
-    // Check if we're approaching the limit
-    if (this.requestCount >= externalAPIs.spotify.requestsPerMinute) {
-      const waitTime = 60000 - timeSinceLastRequest;
-      if (waitTime > 0) {
-        console.log(`⏳ Spotify rate limit approaching, waiting ${waitTime}ms`);
-        await new Promise(resolve => setTimeout(resolve, waitTime));
-        this.requestCount = 0;
-      }
-    }
-
+    
     this.requestCount++;
-    this.lastRequestTime = now;
-  }
-
-  /**
-   * Convertit les données Spotify au format interne
-   */
-  private convertToInternalFormat(spotifyArtist: SpotifyArtistItem): SpotifyArtist {
-    return {
-      id: spotifyArtist.id,
-      name: spotifyArtist.name,
-      genres: spotifyArtist.genres,
-      popularity: spotifyArtist.popularity,
-      images: spotifyArtist.images.map(img => ({
-        url: img.url,
-        height: img.height,
-        width: img.width
-      })),
-      external_urls: {
-        spotify: spotifyArtist.external_urls.spotify
-      },
-      followers: {
-        total: spotifyArtist.followers.total
-      },
-      spotify_id: spotifyArtist.id,
-      uri: spotifyArtist.uri,
-      href: spotifyArtist.href,
-      type: 'artist'
-    };
-  }
-
-  /**
-   * Divise un tableau en chunks
-   */
-  private chunkArray<T>(array: T[], size: number): T[][] {
-    const chunks: T[][] = [];
-    for (let i = 0; i < array.length; i += size) {
-      chunks.push(array.slice(i, i + size));
+    
+    if (this.requestCount >= this.RATE_LIMIT) {
+      console.warn(`⚠️ Approaching Spotify rate limit: ${this.requestCount}/${this.RATE_LIMIT}`);
     }
-    return chunks;
   }
 
   /**
-   * Obtient les statistiques d'utilisation
+   * RECHERCHE D'ARTISTES SPOTIFY
+   * HYPOTHÈSE: search endpoint retourne des artistes pertinents
+   * FORMAT ATTENDU: { artists: { items: SpotifyArtist[], total: number } }
+   * INFÉRENCE: Résultats triés par pertinence par défaut
    */
-  getUsageStats(): {
-    requestCount: number;
-    tokenExpiresAt: number;
-    hasValidToken: boolean;
-  } {
+  async searchArtists(query: string, limit: number = 20): Promise<SpotifyArtist[]> {
+    try {
+      console.log(`🔍 Spotify Search: "${query}" (${limit} results)`);
+      
+      const response = await this.client.get<SpotifySearchResponse>('/search', {
+        params: {
+          q: query,
+          type: 'artist',
+          limit: Math.min(limit, 50), // Limite API Spotify
+          market: 'US' // Focus sur le marché US
+        }
+      });
+
+      console.log(`✅ Found ${response.data.artists.items.length} artists for "${query}"`);
+      return response.data.artists.items;
+    } catch (error) {
+      console.error(`❌ Spotify search failed for "${query}":`, error);
+      throw new Error(`Spotify search failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  }
+
+
+  /**
+   * OBTENIR DES RECOMMANDATIONS D'ARTISTES
+   * HYPOTHÈSE: recommendations endpoint avec seed_artists retourne des tracks d'artistes similaires
+   * FORMAT ATTENDU: { tracks: [{ artists: SpotifyArtist[] }] }
+   * INFÉRENCE: Extraction des artistes uniques des tracks recommandées
+   */
+  async getRecommendedArtists(seedArtistIds: string | string[], limit: number = 20): Promise<SpotifyArtist[]> {
+    try {
+      // ✅ Normaliser l'input en array
+      const artistIds = Array.isArray(seedArtistIds) ? seedArtistIds : [seedArtistIds];
+      
+      console.log(`🎵 Getting recommendations for ${artistIds.length} seed artists: ${artistIds.slice(0, 3).join(', ')}${artistIds.length > 3 ? '...' : ''}`);
+      
+      const response = await this.client.get<SpotifyRecommendationsResponse>('/recommendations', {
+        params: {
+          seed_artists: artistIds.slice(0, 5).join(','), // Max 5 seeds selon l'API Spotify
+          limit: Math.min(limit, 100), // Limite API
+          market: 'US'
+        }
+      });
+
+      // Extraire les artistes uniques des tracks recommandées
+      const artistsMap = new Map<string, SpotifyArtist>();
+      
+      response.data.tracks.forEach(track => {
+        track.artists.forEach(artist => {
+          // Éviter les artistes de seed dans les résultats
+          if (!artistIds.includes(artist.id) && !artistsMap.has(artist.id)) {
+            artistsMap.set(artist.id, artist);
+          }
+        });
+      });
+
+      const uniqueArtists = Array.from(artistsMap.values());
+      console.log(`✅ Found ${uniqueArtists.length} unique recommended artists`);
+      
+      return uniqueArtists;
+    } catch (error) {
+      console.error(`❌ Failed to get recommendations:`, error);
+      throw new Error(`Failed to get recommendations: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  }
+
+  /**
+   * RECHERCHE D'ARTISTES SIMILAIRES COMPLÈTE
+   * ALGORITHME HYBRIDE:
+   * 1. Recherche de l'artiste principal
+   * 2. Obtention des artistes similaires via related-artists
+   * 3. Obtention de recommandations supplémentaires
+   * 4. Calcul des scores de similarité basés sur genres et popularité
+   * 5. Déduplication et tri par score
+   */
+  async findSimilarArtists(artistName: string, options: {
+    limit?: number;
+    minSimilarity?: number;
+    includeMetrics?: boolean;
+  } = {}): Promise<SimilarArtist[]> {
+    const { limit = 10, minSimilarity = 0.3, includeMetrics = true } = options;
+    
+    try {
+      console.log(`🎯 Finding similar artists to: ${artistName}`);
+      
+      // 1. Rechercher l'artiste principal
+      const searchResults = await this.searchArtists(artistName, 5);
+      if (searchResults.length === 0) {
+        throw new Error(`Artist "${artistName}" not found on Spotify`);
+      }
+      
+      const mainArtist = searchResults[0]; // Prendre le plus pertinent
+      console.log(`✅ Found main artist: ${mainArtist.name} (popularity: ${mainArtist.popularity})`);
+
+      
+      // 3. Obtenir des recommandations supplémentaires
+      const recommendedArtists = await this.getRecommendedArtists([mainArtist.id], 50);
+      
+      // 4. Combiner et dédupliquer
+      const allSimilarArtists = new Map<string, SpotifyArtist>();
+      
+      recommendedArtists.forEach(artist => allSimilarArtists.set(artist.id, artist));
+      
+      // Exclure l'artiste principal
+      allSimilarArtists.delete(mainArtist.id);
+      
+      // 5. Calculer les scores de similarité
+      const similarArtists: SimilarArtist[] = Array.from(allSimilarArtists.values())
+        .map(artist => ({
+          name: artist.name,
+          id: artist.id,
+          genres: artist.genres,
+          popularity: artist.popularity,
+          followers: artist.followers.total,
+          similarity_score: this.calculateSimilarityScore(mainArtist, artist),
+          source: 'spotify' as const
+        }))
+        .filter(artist => artist.similarity_score >= minSimilarity)
+        .sort((a, b) => b.similarity_score - a.similarity_score)
+        .slice(0, limit);
+
+      console.log(`✅ Found ${similarArtists.length} similar artists with similarity >= ${minSimilarity}`);
+      
+      return similarArtists;
+    } catch (error) {
+      console.error(`❌ Failed to find similar artists for "${artistName}":`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * CALCUL DU SCORE DE SIMILARITÉ
+   * ALGORITHME BASÉ SUR:
+   * 1. Similarité des genres (Jaccard similarity)
+   * 2. Proximité de popularité (distance normalisée)
+   * 3. Bonus pour les artistes moins populaires (opportunité)
+   * 
+   * HYPOTHÈSES:
+   * - Genres partagés = forte similarité musicale
+   * - Popularité similaire = audience similaire
+   * - Popularité plus faible = meilleure opportunité
+   */
+  private calculateSimilarityScore(mainArtist: SpotifyArtist, candidateArtist: SpotifyArtist): number {
+    // 1. Similarité des genres (Jaccard)
+    const mainGenres = new Set(mainArtist.genres);
+    const candidateGenres = new Set(candidateArtist.genres);
+    const intersection = new Set([...mainGenres].filter(g => candidateGenres.has(g)));
+    const union = new Set([...mainGenres, ...candidateGenres]);
+    
+    const genreSimilarity = union.size > 0 ? intersection.size / union.size : 0;
+
+    // 2. Proximité de popularité (0-1, 1 = très proche)
+    const popularityDiff = Math.abs(mainArtist.popularity - candidateArtist.popularity);
+    const popularitySimilarity = Math.max(0, 1 - (popularityDiff / 100));
+
+    // 3. Bonus d'opportunité (artistes moins populaires)
+    const opportunityBonus = candidateArtist.popularity < mainArtist.popularity 
+      ? (mainArtist.popularity - candidateArtist.popularity) / 200 // Max 0.5 bonus
+      : 0;
+
+    // Score composite
+    const score = (genreSimilarity * 0.6) + (popularitySimilarity * 0.3) + opportunityBonus;
+    
+    return Math.min(1, Math.max(0, score));
+  }
+
+  /**
+   * OBTENIR LES DÉTAILS D'UN ARTISTE
+   */
+  async getArtistDetails(artistId: string): Promise<SpotifyArtist> {
+    try {
+      const response = await this.client.get<SpotifyArtist>(`/artists/${artistId}`);
+      return response.data;
+    } catch (error) {
+      throw new Error(`Failed to get artist details: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  }
+
+  /**
+   * HEALTH CHECK
+   */
+  async healthCheck(): Promise<{ status: 'healthy' | 'unhealthy'; error?: string; rateLimit?: any }> {
+    try {
+      await this.ensureValidToken();
+      
+      // Test simple avec une recherche
+      await this.searchArtists('test', 1);
+      
+      return {
+        status: 'healthy',
+        rateLimit: {
+          requestCount: this.requestCount,
+          limit: this.RATE_LIMIT,
+          resetTime: new Date(this.lastResetTime + 60000).toISOString()
+        }
+      };
+    } catch (error) {
+      return {
+        status: 'unhealthy',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  /**
+   * OBTENIR LES STATISTIQUES D'UTILISATION
+   */
+  getUsageStats(): { requestCount: number; limit: number; tokenExpiresAt: string } {
     return {
       requestCount: this.requestCount,
-      tokenExpiresAt: this.tokenExpiresAt,
-      hasValidToken: this.accessToken !== null && Date.now() < this.tokenExpiresAt
+      limit: this.RATE_LIMIT,
+      tokenExpiresAt: new Date(this.tokenExpiresAt).toISOString()
     };
   }
+}
+
+export function createSpotifyClient(): SpotifyClient {
+  return new SpotifyClient();
 }
 

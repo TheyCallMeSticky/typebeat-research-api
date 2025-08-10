@@ -1,32 +1,21 @@
-// Client pour YouTube Data API v3
+// Client YouTube Data API v3 - VRAIES APIs COMPLÈTES
+// Documentation: https://developers.google.com/youtube/v3/docs
 
 import axios, { AxiosInstance } from 'axios';
-import { YouTubeVideo } from '@/types/artist';
-import { externalAPIs } from '@/lib/config';
 
-export interface YouTubeSearchParams {
-  q: string;
-  maxResults?: number;
-  order?: 'relevance' | 'date' | 'rating' | 'viewCount' | 'title';
-  publishedAfter?: string;
-  publishedBefore?: string;
-  regionCode?: string;
-  type?: 'video' | 'channel' | 'playlist';
-}
-
-export interface YouTubeSearchResponse {
+interface YouTubeSearchResult {
   kind: string;
   etag: string;
   nextPageToken?: string;
-  prevPageToken?: string;
+  regionCode: string;
   pageInfo: {
     totalResults: number;
     resultsPerPage: number;
   };
-  items: YouTubeVideoItem[];
+  items: YouTubeVideo[];
 }
 
-export interface YouTubeVideoItem {
+interface YouTubeVideo {
   kind: string;
   etag: string;
   id: {
@@ -49,34 +38,13 @@ export interface YouTubeVideoItem {
   };
 }
 
-export interface YouTubeVideoDetails {
+interface YouTubeVideoStatistics {
   kind: string;
   etag: string;
   items: Array<{
     kind: string;
     etag: string;
     id: string;
-    snippet: {
-      publishedAt: string;
-      channelId: string;
-      title: string;
-      description: string;
-      channelTitle: string;
-      tags?: string[];
-      categoryId: string;
-      liveBroadcastContent: string;
-      defaultLanguage?: string;
-      defaultAudioLanguage?: string;
-    };
-    contentDetails: {
-      duration: string;
-      dimension: string;
-      definition: string;
-      caption: string;
-      licensedContent: boolean;
-      contentRating: object;
-      projection: string;
-    };
     statistics: {
       viewCount: string;
       likeCount?: string;
@@ -87,32 +55,63 @@ export interface YouTubeVideoDetails {
   }>;
 }
 
+interface YouTubeMetrics {
+  volume: number;
+  competition_level: 'low' | 'medium' | 'high';
+  competition_score: number;
+  trend_direction: 'rising' | 'stable' | 'declining';
+  trend_score: number;
+  saturation_score: number;
+  avg_views: number;
+  median_views: number;
+  total_videos: number;
+  recent_uploads_30d: number;
+  top_creator_dominance: number;
+  calculated_at: Date;
+}
+
+/**
+ * CLIENT YOUTUBE DATA API v3 - IMPLÉMENTATION COMPLÈTE
+ * 
+ * HYPOTHÈSES BASÉES SUR LA DOCUMENTATION OFFICIELLE:
+ * 1. search.list coûte 100 unités de quota
+ * 2. videos.list coûte 1 unité de quota  
+ * 3. Quota quotidien: 10,000 unités
+ * 4. Format des réponses selon la doc officielle
+ * 5. Les type beats sont titrés "[Artist] Type Beat" ou similaire
+ */
 export class YouTubeClient {
   private client: AxiosInstance;
-  private apiKey: string;
   private quotaUsed: number = 0;
-  private dailyQuotaLimit: number;
+  private readonly QUOTA_LIMIT = 10000;
+  
+  // Coûts en unités de quota selon la documentation YouTube
+  private readonly QUOTA_COSTS = {
+    search: 100,        // search.list
+    videos: 1,          // videos.list
+    channels: 1         // channels.list
+  };
 
-  constructor(apiKey: string) {
-    this.apiKey = apiKey;
-    this.dailyQuotaLimit = externalAPIs.youtube.quotaLimitDaily;
-    
+  constructor() {
     this.client = axios.create({
-      baseURL: externalAPIs.youtube.baseURL,
-      timeout: 10000,
+      baseURL: 'https://www.googleapis.com/youtube/v3',
+      timeout: 30000,
       headers: {
         'Accept': 'application/json',
         'User-Agent': 'TypeBeat-Research-API/1.0'
       }
     });
 
-    // Intercepteur pour le rate limiting
-    this.client.interceptors.request.use(async (config) => {
-      await this.checkRateLimit();
+    // Intercepteur pour ajouter la clé API à chaque requête
+    this.client.interceptors.request.use((config) => {
+      config.params = {
+        ...config.params,
+        key: process.env.YOUTUBE_API_KEY
+      };
       return config;
     });
 
-    // Intercepteur pour gérer les erreurs
+    // Intercepteur pour gérer les erreurs et quotas
     this.client.interceptors.response.use(
       (response) => response,
       (error) => {
@@ -128,233 +127,336 @@ export class YouTubeClient {
   }
 
   /**
-   * Recherche de vidéos YouTube
+   * RECHERCHE DE VIDÉOS YOUTUBE
+   * HYPOTHÈSE: La recherche retourne des résultats pertinents pour "artist type beat"
+   * FORMAT ATTENDU: Selon la documentation YouTube Data API v3
+   * INFÉRENCE: Les type beats sont généralement titrés "[Artist] Type Beat" ou "Type Beat - [Artist]"
    */
-  async searchVideos(params: YouTubeSearchParams): Promise<{
-    videos: YouTubeVideo[];
-    totalResults: number;
-    nextPageToken?: string;
-  }> {
-    try {
-      const searchParams = {
-        part: 'snippet',
-        key: this.apiKey,
-        type: 'video',
-        maxResults: Math.min(params.maxResults || 50, 50),
-        q: params.q,
-        order: params.order || 'relevance',
-        ...(params.publishedAfter && { publishedAfter: params.publishedAfter }),
-        ...(params.publishedBefore && { publishedBefore: params.publishedBefore }),
-        ...(params.regionCode && { regionCode: params.regionCode })
-      };
+  async searchVideos(params: {
+    q: string;
+    maxResults?: number;
+    order?: 'relevance' | 'date' | 'viewCount' | 'rating';
+    publishedAfter?: string;
+    publishedBefore?: string;
+  }): Promise<YouTubeSearchResult> {
+    this.checkQuota(this.QUOTA_COSTS.search);
 
-      console.log(`🔍 Searching YouTube for: "${params.q}"`);
+    try {
+      console.log(`🔍 YouTube Search: "${params.q}" (${params.maxResults || 25} results)`);
       
-      const response = await this.client.get<YouTubeSearchResponse>('/search', {
-        params: searchParams
+      const response = await this.client.get<YouTubeSearchResult>('/search', {
+        params: {
+          part: 'snippet',
+          type: 'video',
+          maxResults: params.maxResults || 25,
+          order: params.order || 'relevance',
+          q: params.q,
+          publishedAfter: params.publishedAfter,
+          publishedBefore: params.publishedBefore,
+          regionCode: 'US', // Focus sur le marché US
+          relevanceLanguage: 'en'
+        }
       });
 
-      // Coût en quota : 100 unités pour une recherche
-      this.quotaUsed += externalAPIs.youtube.searchCostUnits;
-
-      const videoIds = response.data.items.map(item => item.id.videoId);
+      this.quotaUsed += this.QUOTA_COSTS.search;
+      console.log(`✅ YouTube Search completed. Quota used: ${this.quotaUsed}/${this.QUOTA_LIMIT}`);
       
-      // Récupérer les détails des vidéos (statistiques, durée)
-      const videoDetails = await this.getVideoDetails(videoIds);
-
-      // Convertir au format interne
-      const videos = this.convertToInternalFormat(response.data.items, videoDetails);
-
-      console.log(`✅ Found ${videos.length} videos (${response.data.pageInfo.totalResults} total)`);
-
-      return {
-        videos,
-        totalResults: response.data.pageInfo.totalResults,
-        nextPageToken: response.data.nextPageToken
-      };
-
+      return response.data;
     } catch (error) {
-      console.error('❌ YouTube search error:', error);
+      console.error('❌ YouTube Search failed:', error);
       throw new Error(`YouTube search failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
   }
 
   /**
-   * Récupère les détails des vidéos (statistiques, durée)
+   * OBTENIR LES STATISTIQUES DES VIDÉOS
+   * HYPOTHÈSE: Les statistiques YouTube fournissent viewCount, likeCount, commentCount
+   * FORMAT ATTENDU: Selon la documentation YouTube Data API v3 videos.list
+   * INFÉRENCE: viewCount est toujours présent, autres métriques peuvent être absentes
    */
-  async getVideoDetails(videoIds: string[]): Promise<YouTubeVideoDetails> {
-    if (videoIds.length === 0) {
-      return { kind: 'youtube#videoListResponse', etag: '', items: [] };
-    }
+  async getVideoStatistics(videoIds: string[]): Promise<YouTubeVideoStatistics> {
+    this.checkQuota(this.QUOTA_COSTS.videos);
 
     try {
-      const response = await this.client.get<YouTubeVideoDetails>('/videos', {
+      console.log(`📊 Getting statistics for ${videoIds.length} videos`);
+      
+      const response = await this.client.get<YouTubeVideoStatistics>('/videos', {
         params: {
-          part: 'snippet,contentDetails,statistics',
-          key: this.apiKey,
-          id: videoIds.join(',')
+          part: 'statistics',
+          id: videoIds.join(','),
+          maxResults: 50 // Limite API YouTube
         }
       });
 
-      // Coût en quota : 1 unité par vidéo
-      this.quotaUsed += videoIds.length * externalAPIs.youtube.videoCostUnits;
-
+      this.quotaUsed += this.QUOTA_COSTS.videos;
       return response.data;
+    } catch (error) {
+      console.error('❌ YouTube Statistics failed:', error);
+      throw new Error(`YouTube statistics failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  }
+
+  /**
+   * ANALYSE COMPLÈTE DES MÉTRIQUES TYPE BEAT
+   * 
+   * HYPOTHÈSES ET INFÉRENCES:
+   * 1. Les type beats récents (30 derniers jours) indiquent la tendance
+   * 2. Le volume total indique la demande (pageInfo.totalResults)
+   * 3. La distribution des vues indique la concurrence
+   * 4. Les créateurs dominants indiquent la saturation du marché
+   * 5. Les titres contiennent généralement "type beat" + nom d'artiste
+   */
+  async analyzeTypeBeatMetrics(artistName: string): Promise<YouTubeMetrics> {
+    const searchQuery = `${artistName} type beat`;
+    console.log(`🎯 Analyzing type beat metrics for: ${artistName}`);
+
+    try {
+      // 1. Recherche principale pour le volume total
+      const mainSearch = await this.searchVideos({
+        q: searchQuery,
+        maxResults: 50,
+        order: 'relevance'
+      });
+
+      // 2. Recherche récente pour les tendances (30 derniers jours)
+      const thirtyDaysAgo = new Date();
+      thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+      
+      const recentSearch = await this.searchVideos({
+        q: searchQuery,
+        maxResults: 50,
+        order: 'date',
+        publishedAfter: thirtyDaysAgo.toISOString()
+      });
+
+      // 3. Obtenir les statistiques détaillées
+      const allVideoIds = [
+        ...mainSearch.items.map(item => item.id.videoId),
+        ...recentSearch.items.map(item => item.id.videoId)
+      ].filter((id, index, arr) => arr.indexOf(id) === index); // Dédupliquer
+
+      const statistics = await this.getVideoStatistics(allVideoIds.slice(0, 50));
+
+      // 4. Calculer les métriques
+      const metrics = this.calculateMetrics(mainSearch, recentSearch, statistics, artistName);
+      
+      console.log(`✅ Analysis completed for ${artistName}:`, {
+        volume: metrics.volume,
+        competition: metrics.competition_level,
+        trend: metrics.trend_direction,
+        total_videos: metrics.total_videos
+      });
+
+      return metrics;
 
     } catch (error) {
-      console.error('❌ YouTube video details error:', error);
-      // Retourner une réponse vide plutôt que de faire échouer toute la recherche
-      return { kind: 'youtube#videoListResponse', etag: '', items: [] };
+      console.error(`❌ Failed to analyze ${artistName}:`, error);
+      throw error;
     }
   }
 
   /**
-   * Recherche spécifique pour les type beats d'un artiste
+   * CALCUL DES MÉTRIQUES BASÉ SUR LES DONNÉES YOUTUBE RÉELLES
+   * 
+   * HYPOTHÈSES ET ALGORITHMES:
+   * - Volume: pageInfo.totalResults (peut être approximatif selon YouTube)
+   * - Concurrence: Coefficient de variation des vues (écart-type/moyenne)
+   * - Tendance: Ratio uploads récents vs volume total
+   * - Saturation: Indice de concentration Herfindahl-Hirschman des créateurs
    */
-  async searchTypeBeat(artistName: string, options: {
-    maxResults?: number;
-    timeRange?: 'week' | 'month' | '3months' | 'year' | 'all';
-    region?: string;
-  } = {}): Promise<{
-    videos: YouTubeVideo[];
-    totalResults: number;
-    query: string;
-  }> {
-    const query = `${artistName} type beat`;
+  private calculateMetrics(
+    mainSearch: YouTubeSearchResult,
+    recentSearch: YouTubeSearchResult,
+    statistics: YouTubeVideoStatistics,
+    artistName: string
+  ): YouTubeMetrics {
     
-    // Calcul des dates pour le filtre temporel
-    let publishedAfter: string | undefined;
-    if (options.timeRange && options.timeRange !== 'all') {
-      const now = new Date();
-      const daysBack = {
-        'week': 7,
-        'month': 30,
-        '3months': 90,
-        'year': 365
-      }[options.timeRange];
-      
-      const pastDate = new Date(now.getTime() - daysBack * 24 * 60 * 60 * 1000);
-      publishedAfter = pastDate.toISOString();
-    }
+    // VOLUME: Estimation basée sur totalResults (peut être approximatif selon YouTube)
+    const volume = Math.min(mainSearch.pageInfo.totalResults, 1000000); // Cap réaliste
+    
+    // STATISTIQUES DES VUES
+    const viewCounts = statistics.items
+      .map(item => parseInt(item.statistics.viewCount))
+      .filter(count => !isNaN(count))
+      .sort((a, b) => b - a);
 
-    const searchResult = await this.searchVideos({
-      q: query,
-      maxResults: options.maxResults || 50,
-      order: 'relevance',
-      publishedAfter,
-      regionCode: options.region
-    });
+    const avgViews = viewCounts.length > 0 
+      ? viewCounts.reduce((sum, views) => sum + views, 0) / viewCounts.length 
+      : 0;
+    
+    const medianViews = viewCounts.length > 0
+      ? viewCounts[Math.floor(viewCounts.length / 2)]
+      : 0;
+
+    // CONCURRENCE: Basée sur la distribution des vues
+    const viewsStdDev = this.calculateStandardDeviation(viewCounts);
+    const competitionScore = this.calculateCompetitionScore(avgViews, medianViews, viewsStdDev);
+    
+    let competitionLevel: 'low' | 'medium' | 'high';
+    if (competitionScore < 0.3) competitionLevel = 'low';
+    else if (competitionScore < 0.7) competitionLevel = 'medium';
+    else competitionLevel = 'high';
+
+    // TENDANCE: Basée sur les uploads récents
+    const recentUploads = recentSearch.items.length;
+    const trendScore = this.calculateTrendScore(recentUploads, volume);
+    
+    let trendDirection: 'rising' | 'stable' | 'declining';
+    if (trendScore > 0.6) trendDirection = 'rising';
+    else if (trendScore > 0.3) trendDirection = 'stable';
+    else trendDirection = 'declining';
+
+    // SATURATION: Dominance des créateurs
+    const channelCounts = this.calculateChannelDominance(mainSearch.items);
+    const saturationScore = this.calculateSaturationScore(channelCounts);
 
     return {
-      ...searchResult,
-      query
+      volume,
+      competition_level: competitionLevel,
+      competition_score: competitionScore,
+      trend_direction: trendDirection,
+      trend_score: trendScore,
+      saturation_score: saturationScore,
+      avg_views: Math.round(avgViews),
+      median_views: medianViews,
+      total_videos: mainSearch.items.length,
+      recent_uploads_30d: recentUploads,
+      top_creator_dominance: channelCounts.dominance,
+      calculated_at: new Date()
     };
   }
 
   /**
-   * Analyse des tendances temporelles pour un artiste
+   * CALCUL DU SCORE DE CONCURRENCE
+   * HYPOTHÈSE: Une grande variance dans les vues indique une concurrence élevée
+   * ALGORITHME: Coefficient de variation + ratio médiane/moyenne
    */
-  async analyzeTrends(artistName: string): Promise<{
-    recent: { videos: YouTubeVideo[]; count: number };
-    older: { videos: YouTubeVideo[]; count: number };
-    growthRate: number;
-  }> {
-    const now = new Date();
-    const threeMonthsAgo = new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000);
-    const sixMonthsAgo = new Date(now.getTime() - 180 * 24 * 60 * 60 * 1000);
-
-    // Recherche des 3 derniers mois
-    const recentSearch = await this.searchTypeBeat(artistName, {
-      maxResults: 50,
-      timeRange: '3months'
-    });
-
-    // Recherche des 3-6 mois précédents
-    const olderSearch = await this.searchVideos({
-      q: `${artistName} type beat`,
-      maxResults: 50,
-      publishedAfter: sixMonthsAgo.toISOString(),
-      publishedBefore: threeMonthsAgo.toISOString()
-    });
-
-    const recentCount = recentSearch.videos.length;
-    const olderCount = olderSearch.videos.length;
+  private calculateCompetitionScore(avgViews: number, medianViews: number, stdDev: number): number {
+    if (avgViews === 0) return 0;
     
-    // Calcul du taux de croissance
-    const growthRate = olderCount > 0 ? ((recentCount - olderCount) / olderCount) * 100 : 0;
+    // Coefficient de variation (écart-type / moyenne)
+    const coefficientOfVariation = stdDev / avgViews;
+    
+    // Ratio médiane/moyenne (proche de 1 = distribution équilibrée)
+    const medianRatio = medianViews / avgViews;
+    
+    // Score composite (0-1, plus élevé = plus de concurrence)
+    return Math.min(1, (coefficientOfVariation * 0.7) + ((1 - medianRatio) * 0.3));
+  }
+
+  /**
+   * CALCUL DU SCORE DE TENDANCE
+   * HYPOTHÈSE: Plus d'uploads récents = tendance croissante
+   * ALGORITHME: Ratio uploads récents / volume total (normalisé)
+   */
+  private calculateTrendScore(recentUploads: number, totalVolume: number): number {
+    if (totalVolume === 0) return 0;
+    
+    // Ratio uploads récents / volume total (normalisé)
+    const recentRatio = recentUploads / Math.min(totalVolume, 1000);
+    
+    // Score normalisé (0-1)
+    return Math.min(1, recentRatio * 10);
+  }
+
+  /**
+   * CALCUL DE LA DOMINANCE DES CRÉATEURS
+   * HYPOTHÈSE: Concentration élevée de créateurs = marché saturé
+   * ALGORITHME: Indice Herfindahl-Hirschman adapté
+   */
+  private calculateChannelDominance(videos: YouTubeVideo[]): { dominance: number; uniqueChannels: number } {
+    const channelCounts: { [channelId: string]: number } = {};
+    
+    videos.forEach(video => {
+      const channelId = video.snippet.channelId;
+      channelCounts[channelId] = (channelCounts[channelId] || 0) + 1;
+    });
+
+    const uniqueChannels = Object.keys(channelCounts).length;
+    const totalVideos = videos.length;
+    
+    if (totalVideos === 0) return { dominance: 0, uniqueChannels: 0 };
+
+    // Calcul de l'indice de concentration Herfindahl-Hirschman
+    const herfindahlIndex = Object.values(channelCounts)
+      .map(count => Math.pow(count / totalVideos, 2))
+      .reduce((sum, squared) => sum + squared, 0);
 
     return {
-      recent: { videos: recentSearch.videos, count: recentCount },
-      older: { videos: olderSearch.videos, count: olderCount },
-      growthRate
+      dominance: herfindahlIndex,
+      uniqueChannels
     };
   }
 
   /**
-   * Vérifie les limites de quota et rate limiting
+   * CALCUL DU SCORE DE SATURATION
+   * HYPOTHÈSE: Dominance élevée + peu de créateurs uniques = saturation élevée
    */
-  private async checkRateLimit(): Promise<void> {
-    // Vérification du quota quotidien
-    if (this.quotaUsed >= this.dailyQuotaLimit) {
-      throw new Error('Daily YouTube API quota limit reached');
+  private calculateSaturationScore(channelData: { dominance: number; uniqueChannels: number }): number {
+    const { dominance, uniqueChannels } = channelData;
+    
+    // Normalisation du nombre de créateurs uniques (plus = moins saturé)
+    const diversityScore = Math.min(1, uniqueChannels / 20); // 20 créateurs = diversité maximale
+    
+    // Score de saturation (0-1, plus élevé = plus saturé)
+    return Math.min(1, dominance + (1 - diversityScore) * 0.3);
+  }
+
+  /**
+   * CALCUL DE L'ÉCART-TYPE
+   */
+  private calculateStandardDeviation(values: number[]): number {
+    if (values.length === 0) return 0;
+    
+    const mean = values.reduce((sum, value) => sum + value, 0) / values.length;
+    const squaredDifferences = values.map(value => Math.pow(value - mean, 2));
+    const variance = squaredDifferences.reduce((sum, diff) => sum + diff, 0) / values.length;
+    
+    return Math.sqrt(variance);
+  }
+
+  /**
+   * VÉRIFICATION DU QUOTA
+   */
+  private checkQuota(cost: number): void {
+    if (this.quotaUsed + cost > this.QUOTA_LIMIT) {
+      throw new Error(`YouTube API quota would be exceeded. Used: ${this.quotaUsed}, Cost: ${cost}, Limit: ${this.QUOTA_LIMIT}`);
     }
-
-    // Rate limiting : max 10 requêtes par seconde
-    await new Promise(resolve => setTimeout(resolve, 100));
   }
 
   /**
-   * Convertit les données YouTube au format interne
+   * OBTENIR L'USAGE DU QUOTA
    */
-  private convertToInternalFormat(
-    searchItems: YouTubeVideoItem[],
-    videoDetails: YouTubeVideoDetails
-  ): YouTubeVideo[] {
-    const detailsMap = new Map(
-      videoDetails.items.map(item => [item.id, item])
-    );
-
-    return searchItems.map(item => {
-      const details = detailsMap.get(item.id.videoId);
-      
-      return {
-        id: item.id.videoId,
-        title: item.snippet.title,
-        channelTitle: item.snippet.channelTitle,
-        publishedAt: item.snippet.publishedAt,
-        viewCount: details?.statistics.viewCount ? parseInt(details.statistics.viewCount) : undefined,
-        likeCount: details?.statistics.likeCount ? parseInt(details.statistics.likeCount) : undefined,
-        commentCount: details?.statistics.commentCount ? parseInt(details.statistics.commentCount) : undefined,
-        duration: details?.contentDetails.duration,
-        thumbnails: {
-          default: item.snippet.thumbnails.default,
-          medium: item.snippet.thumbnails.medium,
-          high: item.snippet.thumbnails.high
-        }
-      };
-    });
-  }
-
-  /**
-   * Obtient les statistiques d'utilisation du quota
-   */
-  getQuotaUsage(): { used: number; limit: number; remaining: number; percentage: number } {
-    const remaining = this.dailyQuotaLimit - this.quotaUsed;
-    const percentage = (this.quotaUsed / this.dailyQuotaLimit) * 100;
-
+  getQuotaUsage(): { used: number; remaining: number; limit: number } {
     return {
       used: this.quotaUsed,
-      limit: this.dailyQuotaLimit,
-      remaining,
-      percentage: Math.round(percentage * 100) / 100
+      remaining: this.QUOTA_LIMIT - this.quotaUsed,
+      limit: this.QUOTA_LIMIT
     };
   }
 
   /**
-   * Remet à zéro le compteur de quota (à appeler chaque jour)
+   * HEALTH CHECK
    */
-  resetQuota(): void {
-    this.quotaUsed = 0;
+  async healthCheck(): Promise<{ status: 'healthy' | 'unhealthy'; error?: string; quota?: any }> {
+    try {
+      // Test simple avec une recherche minimale
+      await this.searchVideos({ q: 'test', maxResults: 1 });
+      
+      return {
+        status: 'healthy',
+        quota: this.getQuotaUsage()
+      };
+    } catch (error) {
+      return {
+        status: 'unhealthy',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
   }
+}
+
+export function createYouTubeClient(): YouTubeClient {
+  return new YouTubeClient();
 }
 

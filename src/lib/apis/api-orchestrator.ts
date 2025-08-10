@@ -1,611 +1,543 @@
-// Orchestrateur pour toutes les APIs externes avec cache intelligent
+// Orchestrateur API unifié - VRAIES APIs COMPLÈTES
+// Coordonne YouTube, Spotify, Last.fm et Genius
 
-import { YouTubeClient } from './youtube-client';
-import { SpotifyClient } from './spotify-client';
-import { LastFmClient } from './lastfm-client';
-import { GeniusClient } from './genius-client';
-import { RedisClient } from '../cache/redis-client';
+import { createYouTubeClient } from './youtube-client';
+import { createSpotifyClient } from './spotify-client';
+import { createLastFmClient } from './lastfm-client';
+import { createGeniusClient } from './genius-client';
+import { createRedisClient } from '../cache/redis-client';
 
-import { Artist, SpotifyArtist, LastFmArtist, YouTubeVideo } from '@/types/artist';
-import { VolumeMetrics, CompetitionMetrics, TrendMetrics, SaturationMetrics, SimilarityMetrics } from '@/types/scoring';
-import { YouTubeAnalyzer } from '../services/youtube-analyzer';
-import { SimilarityCalculator, ArtistSimilarityData } from '../services/similarity-calculator';
-
-export interface APICredentials {
-  youtube: {
-    apiKey: string;
-  };
-  spotify: {
-    clientId: string;
-    clientSecret: string;
-  };
-  lastfm: {
-    apiKey: string;
-    sharedSecret: string;
-  };
-  genius: {
-    clientId: string;
-    clientSecret: string;
-  };
+interface Artist {
+  name: string;
+  id?: string;
+  genres: string[];
+  popularity: number;
+  followers: number;
+  source: 'spotify' | 'lastfm' | 'genius';
 }
 
-export interface APIUsageStats {
-  youtube: {
-    quotaUsed: number;
-    quotaLimit: number;
-    quotaRemaining: number;
-  };
-  spotify: {
-    requestCount: number;
-    hasValidToken: boolean;
-  };
-  lastfm: {
-    requestsInLastSecond: number;
-    totalRequests: number;
-  };
-  genius: {
-    requestCount: number;
-    hasAccessToken: boolean;
-  };
-  cache: {
-    hits: number;
-    misses: number;
-    hitRate: number;
-    totalKeys: number;
-  };
+interface SimilarityMetrics {
+  spotify_similarity: number;
+  lastfm_similarity: number;
+  genre_overlap: number;
+  style_compatibility: number;
+  audience_overlap: number;
 }
 
-export interface ArtistAnalysisResult {
+interface SimilarArtistCandidate {
+  artist: Artist;
+  similarity: SimilarityMetrics;
+  sources: string[];
+}
+
+interface FindSimilarArtistsResult {
   mainArtist: Artist;
-  spotifyData?: SpotifyArtist;
-  lastfmData?: LastFmArtist;
-  geniusData?: any;
-  relatedArtists: {
-    spotify: SpotifyArtist[];
-    lastfm: LastFmArtist[];
-  };
-  youtubeMetrics: {
-    volume: VolumeMetrics;
-    competition: CompetitionMetrics;
-    trends: TrendMetrics;
-    saturation: SaturationMetrics;
-  };
-  similarityMetrics: SimilarityMetrics;
+  candidates: SimilarArtistCandidate[];
   processingTime: number;
-  cached: boolean;
 }
 
+interface YouTubeMetricsResult {
+  volume: number;
+  competition_level: 'low' | 'medium' | 'high';
+  competition_score: number;
+  trend_direction: 'rising' | 'stable' | 'declining';
+  trend_score: number;
+  saturation_score: number;
+  avg_views: number;
+  median_views: number;
+  total_videos: number;
+  recent_uploads_30d: number;
+  top_creator_dominance: number;
+  calculated_at: Date;
+}
+
+interface ArtistAnalysisResult {
+  artist: Artist;
+  youtube_metrics?: YouTubeMetricsResult;
+  genius_metrics?: {
+    followers: number;
+    total_pageviews: number;
+    hot_songs_count: number;
+    popularity_score: number;
+  };
+  lastfm_stats?: {
+    listeners: number;
+    playcount: number;
+    tags: string[];
+  };
+  processing_time: number;
+}
+
+/**
+ * ORCHESTRATEUR API UNIFIÉ - IMPLÉMENTATION COMPLÈTE
+ * 
+ * RESPONSABILITÉS:
+ * 1. Coordonner les appels aux 4 APIs externes
+ * 2. Gérer le cache Redis intelligent
+ * 3. Fusionner les données de sources multiples
+ * 4. Calculer les scores de similarité cross-platform
+ * 5. Gérer les fallbacks gracieux
+ * 6. Optimiser les performances avec parallélisation
+ */
 export class APIOrchestrator {
-  private youtube: YouTubeClient;
-  private spotify: SpotifyClient;
-  private lastfm: LastFmClient;
-  private genius: GeniusClient;
-  private cache: RedisClient;
-  private isInitialized: boolean = false;
+  private youtubeClient;
+  private spotifyClient;
+  private lastfmClient;
+  private geniusClient;
+  private cacheClient;
 
-  constructor(credentials: APICredentials, cache: RedisClient) {
-    this.youtube = new YouTubeClient(credentials.youtube.apiKey);
-    this.spotify = new SpotifyClient(credentials.spotify.clientId, credentials.spotify.clientSecret);
-    this.lastfm = new LastFmClient(credentials.lastfm.apiKey);
-    this.genius = new GeniusClient(credentials.genius.clientId, credentials.genius.clientSecret);
-    this.cache = cache;
+  constructor() {
+    this.youtubeClient = createYouTubeClient();
+    this.spotifyClient = createSpotifyClient();
+    this.lastfmClient = createLastFmClient();
+    this.geniusClient = createGeniusClient();
+    this.cacheClient = createRedisClient();
   }
 
   /**
-   * Initialise tous les services
+   * ANALYSE COMPLÈTE D'UN ARTISTE
+   * ALGORITHME:
+   * 1. Vérification du cache
+   * 2. Recherche parallèle sur toutes les plateformes
+   * 3. Enrichissement avec métadonnées
+   * 4. Fusion des données
+   * 5. Mise en cache du résultat
    */
-  async initialize(): Promise<void> {
-    try {
-      console.log('🚀 Initializing API Orchestrator...');
-      
-      // Initialiser le cache Redis
-      if (!this.cache.isReady()) {
-        await this.cache.connect();
-      }
-
-      // Vérifier la disponibilité des APIs
-      const healthChecks = await Promise.allSettled([
-        this.checkYouTubeHealth(),
-        this.checkSpotifyHealth(),
-        this.checkLastFmHealth(),
-        this.checkGeniusHealth()
-      ]);
-
-      const results = healthChecks.map((result, index) => {
-        const apiNames = ['YouTube', 'Spotify', 'Last.fm', 'Genius'];
-        const apiName = apiNames[index];
-        
-        if (result.status === 'fulfilled' && result.value) {
-          console.log(`✅ ${apiName} API ready`);
-          return true;
-        } else {
-          console.warn(`⚠️ ${apiName} API not available`);
-          return false;
-        }
-      });
-
-      const availableAPIs = results.filter(Boolean).length;
-      console.log(`🎯 API Orchestrator initialized with ${availableAPIs}/4 APIs available`);
-      
-      this.isInitialized = true;
-
-    } catch (error) {
-      console.error('❌ Failed to initialize API Orchestrator:', error);
-      throw new Error('API Orchestrator initialization failed');
-    }
-  }
-
-  /**
-   * Analyse complète d'un artiste avec cache intelligent
-   */
-  async analyzeArtist(artistName: string, options: {
-    forceRefresh?: boolean;
-    includeRelated?: boolean;
-    maxRelated?: number;
-  } = {}): Promise<ArtistAnalysisResult> {
+  async analyzeArtist(artistName: string, forceRefresh: boolean = false): Promise<ArtistAnalysisResult | null> {
     const startTime = Date.now();
-    const cacheKey = this.cache.generateKey('artist_analysis', artistName, JSON.stringify(options));
+    const cacheKey = `artist_analysis:${artistName.toLowerCase()}`;
 
     try {
-      // Vérifier le cache si pas de refresh forcé
-      if (!options.forceRefresh) {
-        const cached = await this.cache.get<ArtistAnalysisResult>(cacheKey);
-        if (cached) {
-          console.log(`💾 Using cached analysis for "${artistName}"`);
-          return {
-            ...cached,
-            processingTime: Date.now() - startTime,
-            cached: true
-          };
+      console.log(`🎯 Starting complete analysis for: ${artistName}`);
+
+      // 1. Vérifier le cache (sauf si forceRefresh)
+      if (!forceRefresh) {
+        try {
+          const cached = await this.cacheClient.get(cacheKey);
+          if (cached) {
+            console.log(`✅ Found cached analysis for ${artistName}`);
+            return JSON.parse(cached);
+          }
+        } catch (error) {
+          console.warn(`⚠️ Cache read failed for ${artistName}:`, error);
         }
       }
 
-      console.log(`🔍 Starting complete analysis for "${artistName}"`);
-
-      // 1. Recherche de base sur toutes les plateformes
-      const [spotifyResult, lastfmResult, geniusResult] = await Promise.allSettled([
-        this.getSpotifyArtistData(artistName),
-        this.getLastFmArtistData(artistName),
-        this.getGeniusArtistData(artistName)
+      // 2. Recherche parallèle sur toutes les plateformes
+      console.log(`🔍 Searching ${artistName} across all platforms...`);
+      
+      const [spotifyResults, lastfmResults, geniusResults] = await Promise.allSettled([
+        this.spotifyClient.searchArtists(artistName, 1),
+        this.lastfmClient.searchArtists(artistName, 1),
+        this.geniusClient.findArtist(artistName)
       ]);
 
-      const spotifyData = spotifyResult.status === 'fulfilled' ? spotifyResult.value : undefined;
-      const lastfmData = lastfmResult.status === 'fulfilled' ? lastfmResult.value : undefined;
-      const geniusData = geniusResult.status === 'fulfilled' ? geniusResult.value : undefined;
+      // 3. Extraire l'artiste principal (priorité Spotify > Last.fm > Genius)
+      let mainArtist: Artist | null = null;
 
-      // 2. Créer l'objet artiste principal
-      const mainArtist = this.createMainArtist(artistName, spotifyData, lastfmData);
-
-      // 3. Récupérer les artistes similaires si demandé
-      let relatedArtists: { spotify: SpotifyArtist[]; lastfm: LastFmArtist[] } = { spotify: [], lastfm: [] };
-      if (options.includeRelated) {
-        relatedArtists = await this.getRelatedArtists(artistName, options.maxRelated || 20);
+      if (spotifyResults.status === 'fulfilled' && spotifyResults.value.length > 0) {
+        const spotifyArtist = spotifyResults.value[0];
+        mainArtist = {
+          name: spotifyArtist.name,
+          id: spotifyArtist.id,
+          genres: spotifyArtist.genres,
+          popularity: spotifyArtist.popularity,
+          followers: spotifyArtist.followers.total,
+          source: 'spotify'
+        };
+      } else if (lastfmResults.status === 'fulfilled' && lastfmResults.value.length > 0) {
+        const lastfmArtist = lastfmResults.value[0];
+        mainArtist = {
+          name: lastfmArtist.name,
+          id: lastfmArtist.mbid || undefined,
+          genres: [], // Sera enrichi plus tard
+          popularity: 0, // Sera calculé plus tard
+          followers: 0, // Sera enrichi plus tard
+          source: 'lastfm'
+        };
+      } else if (geniusResults.status === 'fulfilled' && geniusResults.value) {
+        const geniusArtist = geniusResults.value;
+        mainArtist = {
+          name: geniusArtist.name,
+          id: geniusArtist.id.toString(),
+          genres: [],
+          popularity: 0,
+          followers: geniusArtist.stats?.followers_count || 0,
+          source: 'genius'
+        };
       }
 
-      // 4. Analyser YouTube
-      const youtubeMetrics = await this.analyzeYouTubeMetrics(artistName);
+      if (!mainArtist) {
+        console.log(`❌ Artist "${artistName}" not found on any platform`);
+        return null;
+      }
 
-      // 5. Calculer les métriques de similarité
-      const similarityMetrics = this.calculateSimilarityMetrics(
-        mainArtist,
-        spotifyData,
-        lastfmData,
-        relatedArtists
-      );
+      console.log(`✅ Found main artist: ${mainArtist.name} (source: ${mainArtist.source})`);
 
+      // 4. Enrichissement parallèle avec métadonnées détaillées
+      console.log(`📊 Enriching ${mainArtist.name} with detailed metrics...`);
+      
+      const [youtubeMetrics, geniusMetrics, lastfmStats] = await Promise.allSettled([
+        this.youtubeClient.analyzeTypeBeatMetrics(mainArtist.name),
+        this.geniusClient.analyzeArtistMetrics(mainArtist.name),
+        this.lastfmClient.getArtistStats(mainArtist.name)
+      ]);
+
+      // 5. Enrichir avec tags Last.fm si pas de genres
+      if (mainArtist.genres.length === 0) {
+        try {
+          const tags = await this.lastfmClient.getArtistTopTags(mainArtist.name);
+          mainArtist.genres = tags.slice(0, 5); // Top 5 tags comme genres
+        } catch (error) {
+          console.warn(`⚠️ Failed to get tags for ${mainArtist.name}`);
+        }
+      }
+
+      // 6. Construire le résultat final
       const result: ArtistAnalysisResult = {
-        mainArtist,
-        spotifyData,
-        lastfmData,
-        geniusData,
-        relatedArtists,
-        youtubeMetrics,
-        similarityMetrics,
-        processingTime: Date.now() - startTime,
-        cached: false
+        artist: mainArtist,
+        processing_time: Date.now() - startTime
       };
 
-      // Mettre en cache le résultat
-      await this.cache.set(cacheKey, result, undefined, 'artist_analysis');
+      // Ajouter les métriques YouTube si disponibles
+      if (youtubeMetrics.status === 'fulfilled') {
+        result.youtube_metrics = youtubeMetrics.value;
+        console.log(`✅ YouTube metrics: ${youtubeMetrics.value.volume} volume, ${youtubeMetrics.value.competition_level} competition`);
+      } else {
+        console.warn(`⚠️ YouTube metrics failed:`, youtubeMetrics.reason);
+      }
 
-      console.log(`✅ Analysis completed for "${artistName}" in ${result.processingTime}ms`);
+      // Ajouter les métriques Genius si disponibles
+      if (geniusMetrics.status === 'fulfilled' && geniusMetrics.value) {
+        result.genius_metrics = {
+          followers: geniusMetrics.value.followers,
+          total_pageviews: geniusMetrics.value.total_pageviews,
+          hot_songs_count: geniusMetrics.value.hot_songs_count,
+          popularity_score: geniusMetrics.value.popularity_score
+        };
+        console.log(`✅ Genius metrics: ${geniusMetrics.value.followers} followers, ${geniusMetrics.value.total_pageviews} pageviews`);
+      } else {
+        console.warn(`⚠️ Genius metrics failed or unavailable`);
+      }
+
+      // Ajouter les stats Last.fm si disponibles
+      if (lastfmStats.status === 'fulfilled') {
+        try {
+          const tags = await this.lastfmClient.getArtistTopTags(mainArtist.name);
+          result.lastfm_stats = {
+            listeners: lastfmStats.value.listeners,
+            playcount: lastfmStats.value.playcount,
+            tags
+          };
+          console.log(`✅ Last.fm stats: ${lastfmStats.value.listeners} listeners, ${lastfmStats.value.playcount} plays`);
+        } catch (error) {
+          result.lastfm_stats = {
+            listeners: lastfmStats.value.listeners,
+            playcount: lastfmStats.value.playcount,
+            tags: []
+          };
+        }
+      } else {
+        console.warn(`⚠️ Last.fm stats failed:`, lastfmStats.reason);
+      }
+
+      // 7. Mettre en cache le résultat (TTL: 24h)
+      try {
+        await this.cacheClient.setWithTTL(cacheKey, JSON.stringify(result), 86400);
+        console.log(`💾 Cached analysis for ${artistName}`);
+      } catch (error) {
+        console.warn(`⚠️ Failed to cache analysis:`, error);
+      }
+
+      console.log(`✅ Complete analysis finished for ${artistName} in ${Date.now() - startTime}ms`);
       return result;
 
     } catch (error) {
-      console.error(`❌ Analysis failed for "${artistName}":`, error);
-      throw new Error(`Artist analysis failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      console.error(`❌ Failed to analyze ${artistName}:`, error);
+      throw error;
     }
   }
 
   /**
-   * Recherche d'artistes similaires avec scoring
+   * RECHERCHE D'ARTISTES SIMILAIRES CROSS-PLATFORM
+   * ALGORITHME:
+   * 1. Recherche parallèle sur Spotify et Last.fm
+   * 2. Déduplication et fusion des résultats
+   * 3. Calcul des scores de similarité cross-platform
+   * 4. Enrichissement avec métadonnées
+   * 5. Tri par score de similarité composite
    */
-  async findSimilarArtists(
-    mainArtistName: string,
-    options: {
-      limit?: number;
-      minSimilarity?: number;
-      includeMetrics?: boolean;
-      sources?: ('spotify' | 'lastfm')[];
-    } = {}
-  ): Promise<{
-    mainArtist: Artist;
-    candidates: Array<{
-      artist: Artist;
-      similarity: SimilarityMetrics;
-      sources: string[];
-    }>;
-    processingTime: number;
-  }> {
+  async findSimilarArtists(artistName: string, options: {
+    limit?: number;
+    minSimilarity?: number;
+    includeMetrics?: boolean;
+    sources?: ('spotify' | 'lastfm')[];
+  } = {}): Promise<FindSimilarArtistsResult> {
     const startTime = Date.now();
-    const cacheKey = this.cache.generateKey('similar_artists', mainArtistName, JSON.stringify(options));
+    const { limit = 10, minSimilarity = 0.3, includeMetrics = true, sources = ['spotify', 'lastfm'] } = options;
 
     try {
-      // Vérifier le cache
-      const cached = await this.cache.get(cacheKey);
-      if (cached) {
-        console.log(`💾 Using cached similar artists for "${mainArtistName}"`);
-        return cached;
+      console.log(`🎯 Finding similar artists to: ${artistName} (sources: ${sources.join(', ')})`);
+
+      // 1. Obtenir l'artiste principal pour référence
+      const mainArtistAnalysis = await this.analyzeArtist(artistName);
+      if (!mainArtistAnalysis) {
+        throw new Error(`Main artist "${artistName}" not found`);
       }
 
-      console.log(`🔍 Finding similar artists for "${mainArtistName}"`);
+      const mainArtist = mainArtistAnalysis.artist;
 
-      // 1. Analyser l'artiste principal
-      const mainAnalysis = await this.analyzeArtist(mainArtistName, { includeRelated: true });
-
-      // 2. Collecter tous les candidats
-      const candidates = new Map<string, {
-        artist: Artist;
-        sources: string[];
-        spotifyData?: SpotifyArtist;
-        lastfmData?: LastFmArtist;
-      }>();
-
-      // Ajouter les artistes Spotify
-      if (!options.sources || options.sources.includes('spotify')) {
-        mainAnalysis.relatedArtists.spotify.forEach(spotifyArtist => {
-          const artist = this.convertSpotifyToArtist(spotifyArtist);
-          candidates.set(artist.name.toLowerCase(), {
-            artist,
-            sources: ['spotify'],
-            spotifyData: spotifyArtist
-          });
-        });
+      // 2. Recherche parallèle d'artistes similaires
+      const searchPromises: Promise<any>[] = [];
+      
+      if (sources.includes('spotify')) {
+        searchPromises.push(
+          this.spotifyClient.findSimilarArtists(artistName, { limit: limit * 2, minSimilarity: 0.2 })
+        );
+      }
+      
+      if (sources.includes('lastfm')) {
+        searchPromises.push(
+          this.lastfmClient.findSimilarArtistsWithMetadata(artistName, { limit: limit * 2, minSimilarity: 0.2 })
+        );
       }
 
-      // Ajouter les artistes Last.fm
-      if (!options.sources || options.sources.includes('lastfm')) {
-        mainAnalysis.relatedArtists.lastfm.forEach(lastfmArtist => {
-          const artist = this.convertLastFmToArtist(lastfmArtist);
-          const key = artist.name.toLowerCase();
+      const results = await Promise.allSettled(searchPromises);
+
+      // 3. Fusionner et dédupliquer les résultats
+      const allCandidates = new Map<string, SimilarArtistCandidate>();
+
+      // Traiter les résultats Spotify
+      if (sources.includes('spotify') && results[0]?.status === 'fulfilled') {
+        const spotifyArtists = results[0].value;
+        console.log(`✅ Found ${spotifyArtists.length} similar artists from Spotify`);
+
+        for (const spotifyArtist of spotifyArtists) {
+          const key = spotifyArtist.name.toLowerCase();
           
-          if (candidates.has(key)) {
-            // Fusionner les sources
-            const existing = candidates.get(key)!;
-            existing.sources.push('lastfm');
-            existing.lastfmData = lastfmArtist;
-          } else {
-            candidates.set(key, {
-              artist,
-              sources: ['lastfm'],
-              lastfmData: lastfmArtist
+          if (!allCandidates.has(key)) {
+            allCandidates.set(key, {
+              artist: {
+                name: spotifyArtist.name,
+                id: spotifyArtist.id,
+                genres: spotifyArtist.genres,
+                popularity: spotifyArtist.popularity,
+                followers: spotifyArtist.followers,
+                source: 'spotify'
+              },
+              similarity: {
+                spotify_similarity: spotifyArtist.similarity_score,
+                lastfm_similarity: 0,
+                genre_overlap: this.calculateGenreOverlap(mainArtist.genres, spotifyArtist.genres),
+                style_compatibility: spotifyArtist.similarity_score,
+                audience_overlap: this.calculateAudienceOverlap(mainArtist.popularity, spotifyArtist.popularity)
+              },
+              sources: ['spotify']
             });
+          } else {
+            // Mettre à jour avec les données Spotify
+            const existing = allCandidates.get(key)!;
+            existing.similarity.spotify_similarity = spotifyArtist.similarity_score;
+            existing.sources.push('spotify');
           }
-        });
+        }
       }
 
-      // 3. Calculer les métriques de similarité pour chaque candidat
-      const candidatesWithSimilarity = Array.from(candidates.values()).map(candidate => {
-        const similarityData: ArtistSimilarityData = {
-          mainArtist: mainAnalysis.mainArtist,
-          candidateArtist: candidate.artist,
-          spotifyData: candidate.spotifyData ? {
-            mainArtist: mainAnalysis.spotifyData!,
-            candidateArtist: candidate.spotifyData,
-            isRelated: true
-          } : undefined,
-          lastfmData: candidate.lastfmData ? {
-            similarityScore: candidate.lastfmData.match,
-            sharedTags: [] // TODO: Implémenter si nécessaire
-          } : undefined
-        };
+      // Traiter les résultats Last.fm
+      const lastfmIndex = sources.includes('spotify') ? 1 : 0;
+      if (sources.includes('lastfm') && results[lastfmIndex]?.status === 'fulfilled') {
+        const lastfmArtists = results[lastfmIndex].value;
+        console.log(`✅ Found ${lastfmArtists.length} similar artists from Last.fm`);
 
-        const similarity = SimilarityCalculator.calculateSimilarityMetrics(similarityData);
-
-        return {
-          artist: candidate.artist,
-          similarity,
-          sources: candidate.sources
-        };
-      });
-
-      // 4. Filtrer et trier
-      const filtered = candidatesWithSimilarity
-        .filter(candidate => {
-          if (options.minSimilarity) {
-            const avgSimilarity = (
-              candidate.similarity.spotify_similarity +
-              candidate.similarity.lastfm_similarity +
-              candidate.similarity.genre_overlap +
-              candidate.similarity.style_compatibility +
-              candidate.similarity.audience_overlap
-            ) / 5;
-            return avgSimilarity >= options.minSimilarity;
+        for (const lastfmArtist of lastfmArtists) {
+          const key = lastfmArtist.name.toLowerCase();
+          
+          if (!allCandidates.has(key)) {
+            allCandidates.set(key, {
+              artist: {
+                name: lastfmArtist.name,
+                id: undefined,
+                genres: lastfmArtist.tags,
+                popularity: this.calculatePopularityFromLastFm(lastfmArtist.listeners, lastfmArtist.playcount),
+                followers: lastfmArtist.listeners,
+                source: 'lastfm'
+              },
+              similarity: {
+                spotify_similarity: 0,
+                lastfm_similarity: lastfmArtist.similarity_score,
+                genre_overlap: this.calculateGenreOverlap(mainArtist.genres, lastfmArtist.tags),
+                style_compatibility: lastfmArtist.similarity_score,
+                audience_overlap: 0.5 // Valeur par défaut
+              },
+              sources: ['lastfm']
+            });
+          } else {
+            // Mettre à jour avec les données Last.fm
+            const existing = allCandidates.get(key)!;
+            existing.similarity.lastfm_similarity = lastfmArtist.similarity_score;
+            existing.sources.push('lastfm');
           }
-          return true;
-        })
-        .sort((a, b) => {
-          // Trier par score de similarité global
-          const scoreA = (a.similarity.spotify_similarity + a.similarity.lastfm_similarity + a.similarity.genre_overlap) / 3;
-          const scoreB = (b.similarity.spotify_similarity + b.similarity.lastfm_similarity + b.similarity.genre_overlap) / 3;
-          return scoreB - scoreA;
-        })
-        .slice(0, options.limit || 20);
+        }
+      }
 
-      const result = {
-        mainArtist: mainAnalysis.mainArtist,
-        candidates: filtered,
+      // 4. Calculer les scores de similarité composite
+      const candidates: SimilarArtistCandidate[] = Array.from(allCandidates.values())
+        .map(candidate => {
+          // Score composite basé sur les sources disponibles
+          const spotifyWeight = candidate.sources.includes('spotify') ? 0.6 : 0;
+          const lastfmWeight = candidate.sources.includes('lastfm') ? 0.4 : 0;
+          const totalWeight = spotifyWeight + lastfmWeight;
+
+          if (totalWeight === 0) return candidate;
+
+          const compositeScore = (
+            candidate.similarity.spotify_similarity * spotifyWeight +
+            candidate.similarity.lastfm_similarity * lastfmWeight
+          ) / totalWeight;
+
+          // Bonus pour artistes présents sur plusieurs plateformes
+          const crossPlatformBonus = candidate.sources.length > 1 ? 0.1 : 0;
+
+          candidate.similarity.style_compatibility = Math.min(1, compositeScore + crossPlatformBonus);
+
+          return candidate;
+        })
+        .filter(candidate => candidate.similarity.style_compatibility >= minSimilarity)
+        .sort((a, b) => b.similarity.style_compatibility - a.similarity.style_compatibility)
+        .slice(0, limit);
+
+      console.log(`✅ Found ${candidates.length} similar artists with similarity >= ${minSimilarity}`);
+
+      return {
+        mainArtist,
+        candidates,
         processingTime: Date.now() - startTime
       };
 
-      // Mettre en cache
-      await this.cache.set(cacheKey, result, undefined, 'artist_suggestions');
-
-      console.log(`✅ Found ${filtered.length} similar artists for "${mainArtistName}"`);
-      return result;
-
     } catch (error) {
-      console.error(`❌ Similar artists search failed for "${mainArtistName}":`, error);
-      throw new Error(`Similar artists search failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      console.error(`❌ Failed to find similar artists for ${artistName}:`, error);
+      throw error;
     }
   }
 
   /**
-   * Analyse YouTube avec cache
+   * CALCUL DES MÉTRIQUES YOUTUBE POUR UN ARTISTE
    */
-  async analyzeYouTubeMetrics(artistName: string): Promise<{
-    volume: VolumeMetrics;
-    competition: CompetitionMetrics;
-    trends: TrendMetrics;
-    saturation: SaturationMetrics;
-  }> {
-    const cacheKey = this.cache.generateKey('youtube_metrics', artistName);
+  async calculateYouTubeMetrics(artistName: string): Promise<YouTubeMetricsResult> {
+    const cacheKey = `youtube_metrics:${artistName.toLowerCase()}`;
 
-    return await this.cache.getOrSet(
-      cacheKey,
-      async () => {
-        console.log(`📺 Analyzing YouTube metrics for "${artistName}"`);
-        
-        const searchResult = await this.youtube.searchTypeBeat(artistName, {
-          maxResults: 50
-        });
-
-        const analysis = YouTubeAnalyzer.analyzeComplete(searchResult, searchResult.query);
-        
-        return {
-          volume: analysis.volumeMetrics,
-          competition: analysis.competitionMetrics,
-          trends: analysis.trendMetrics,
-          saturation: analysis.saturationMetrics
-        };
-      },
-      undefined,
-      'youtube_search'
-    );
-  }
-
-  /**
-   * Obtient les statistiques d'utilisation de toutes les APIs
-   */
-  async getUsageStats(): Promise<APIUsageStats> {
-    const youtubeStats = this.youtube.getQuotaUsage();
-    const spotifyStats = this.spotify.getUsageStats();
-    const lastfmStats = this.lastfm.getUsageStats();
-    const geniusStats = this.genius.getUsageStats();
-    const cacheStats = await this.cache.getStats();
-
-    return {
-      youtube: {
-        quotaUsed: youtubeStats.used,
-        quotaLimit: youtubeStats.limit,
-        quotaRemaining: youtubeStats.remaining
-      },
-      spotify: {
-        requestCount: spotifyStats.requestCount,
-        hasValidToken: spotifyStats.hasValidToken
-      },
-      lastfm: {
-        requestsInLastSecond: lastfmStats.requestsInLastSecond,
-        totalRequests: lastfmStats.totalRequests
-      },
-      genius: {
-        requestCount: geniusStats.requestCount,
-        hasAccessToken: geniusStats.hasAccessToken
-      },
-      cache: {
-        hits: cacheStats.hits,
-        misses: cacheStats.misses,
-        hitRate: cacheStats.hitRate,
-        totalKeys: cacheStats.totalKeys
+    try {
+      // Vérifier le cache (TTL: 6h pour les métriques YouTube)
+      const cached = await this.cacheClient.get(cacheKey);
+      if (cached) {
+        console.log(`✅ Found cached YouTube metrics for ${artistName}`);
+        return JSON.parse(cached);
       }
-    };
+
+      console.log(`📊 Calculating YouTube metrics for: ${artistName}`);
+      const metrics = await this.youtubeClient.analyzeTypeBeatMetrics(artistName);
+
+      // Mettre en cache (TTL: 6h)
+      await this.cacheClient.setWithTTL(cacheKey, JSON.stringify(metrics), 21600);
+
+      return metrics;
+    } catch (error) {
+      console.error(`❌ Failed to calculate YouTube metrics for ${artistName}:`, error);
+      throw error;
+    }
   }
 
   /**
-   * Nettoie le cache et optimise les performances
+   * HEALTH CHECK DE TOUTES LES APIs
    */
-  async optimizeCache(): Promise<{
-    deletedEntries: number;
-    memoryFreed: string;
-    optimizationTime: number;
-  }> {
-    const startTime = Date.now();
-    
-    console.log('🧹 Starting cache optimization...');
-    
-    const deletedEntries = await this.cache.cleanup();
-    const statsAfter = await this.cache.getStats();
-    
-    const result = {
-      deletedEntries,
-      memoryFreed: statsAfter.memoryUsage,
-      optimizationTime: Date.now() - startTime
+  async healthCheck(): Promise<{
+    status: 'healthy' | 'degraded' | 'unhealthy';
+    services: {
+      youtube: 'healthy' | 'unhealthy';
+      spotify: 'healthy' | 'unhealthy';
+      lastfm: 'healthy' | 'unhealthy';
+      genius: 'healthy' | 'unhealthy';
+      redis: 'healthy' | 'unhealthy';
     };
-    
-    console.log(`✅ Cache optimization completed: ${deletedEntries} entries removed in ${result.optimizationTime}ms`);
-    
-    return result;
-  }
-
-  // Méthodes privées
-
-  private async getSpotifyArtistData(artistName: string): Promise<SpotifyArtist | undefined> {
-    const cacheKey = this.cache.generateKey('spotify_artist', artistName);
-    
-    return await this.cache.getOrSet(
-      cacheKey,
-      async () => {
-        const result = await this.spotify.searchArtists(artistName, 1);
-        return result.artists[0];
-      },
-      undefined,
-      'spotify_artist'
-    );
-  }
-
-  private async getLastFmArtistData(artistName: string): Promise<LastFmArtist | undefined> {
-    const cacheKey = this.cache.generateKey('lastfm_artist', artistName);
-    
-    return await this.cache.getOrSet(
-      cacheKey,
-      async () => {
-        const result = await this.lastfm.analyzeArtist(artistName);
-        return result.artistInfo || undefined;
-      },
-      undefined,
-      'lastfm_artist_info'
-    );
-  }
-
-  private async getGeniusArtistData(artistName: string): Promise<any> {
-    const cacheKey = this.cache.generateKey('genius_artist', artistName);
-    
-    return await this.cache.getOrSet(
-      cacheKey,
-      async () => {
-        return await this.genius.findArtist(artistName);
-      },
-      undefined,
-      'genius_artist'
-    );
-  }
-
-  private async getRelatedArtists(artistName: string, maxResults: number): Promise<{
-    spotify: SpotifyArtist[];
-    lastfm: LastFmArtist[];
+    details: any;
   }> {
-    const [spotifyRelated, lastfmRelated] = await Promise.allSettled([
-      this.spotify.findSimilarArtists(artistName, maxResults),
-      this.lastfm.getSimilarArtists(artistName, maxResults)
+    console.log(`🏥 Running health check on all services...`);
+
+    const [youtubeHealth, spotifyHealth, lastfmHealth, geniusHealth, redisHealth] = await Promise.allSettled([
+      this.youtubeClient.healthCheck(),
+      this.spotifyClient.healthCheck(),
+      this.lastfmClient.healthCheck(),
+      this.geniusClient.healthCheck(),
+      this.cacheClient.ping()
     ]);
 
-    return {
-      spotify: spotifyRelated.status === 'fulfilled' ? spotifyRelated.value.relatedArtists : [],
-      lastfm: lastfmRelated.status === 'fulfilled' ? lastfmRelated.value.similarArtists : []
-    };
-  }
+    const services = {
+      youtube: youtubeHealth.status === 'fulfilled' && youtubeHealth.value.status === 'healthy' ? 'healthy' : 'unhealthy',
+      spotify: spotifyHealth.status === 'fulfilled' && spotifyHealth.value.status === 'healthy' ? 'healthy' : 'unhealthy',
+      lastfm: lastfmHealth.status === 'fulfilled' && lastfmHealth.value.status === 'healthy' ? 'healthy' : 'unhealthy',
+      genius: geniusHealth.status === 'fulfilled' && geniusHealth.value.status === 'healthy' ? 'healthy' : 'unhealthy',
+      redis: redisHealth.status === 'fulfilled' ? 'healthy' : 'unhealthy'
+    } as const;
 
-  private createMainArtist(
-    name: string,
-    spotifyData?: SpotifyArtist,
-    lastfmData?: LastFmArtist
-  ): Artist {
-    return {
-      id: spotifyData?.spotify_id || name.toLowerCase().replace(/\s+/g, '-'),
-      name: spotifyData?.name || lastfmData?.name || name,
-      genres: spotifyData?.genres || [],
-      popularity: spotifyData?.popularity
-    };
-  }
+    // Déterminer le statut global
+    const healthyCount = Object.values(services).filter(status => status === 'healthy').length;
+    const totalServices = Object.keys(services).length;
 
-  private convertSpotifyToArtist(spotifyArtist: SpotifyArtist): Artist {
-    return {
-      id: spotifyArtist.spotify_id,
-      name: spotifyArtist.name,
-      genres: spotifyArtist.genres,
-      popularity: spotifyArtist.popularity
-    };
-  }
-
-  private convertLastFmToArtist(lastfmArtist: LastFmArtist): Artist {
-    return {
-      id: lastfmArtist.name.toLowerCase().replace(/\s+/g, '-'),
-      name: lastfmArtist.name,
-      genres: [], // Last.fm ne fournit pas de genres dans cette structure
-      popularity: Math.round(lastfmArtist.match * 100) // Convertir le score de match en popularité
-    };
-  }
-
-  private calculateSimilarityMetrics(
-    mainArtist: Artist,
-    spotifyData?: SpotifyArtist,
-    lastfmData?: LastFmArtist,
-    relatedArtists?: { spotify: SpotifyArtist[]; lastfm: LastFmArtist[] }
-  ): SimilarityMetrics {
-    // Calcul basique pour l'artiste principal
-    return {
-      spotify_similarity: spotifyData ? 1.0 : 0.0,
-      lastfm_similarity: lastfmData ? 1.0 : 0.0,
-      genre_overlap: 1.0,
-      style_compatibility: 1.0,
-      audience_overlap: 1.0
-    };
-  }
-
-  // Health checks
-
-  private async checkYouTubeHealth(): Promise<boolean> {
-    try {
-      await this.youtube.searchVideos({ q: 'test', maxResults: 1 });
-      return true;
-    } catch (error) {
-      return false;
+    let globalStatus: 'healthy' | 'degraded' | 'unhealthy';
+    if (healthyCount === totalServices) {
+      globalStatus = 'healthy';
+    } else if (healthyCount >= totalServices - 1) { // Au moins 4/5 services fonctionnent
+      globalStatus = 'degraded';
+    } else {
+      globalStatus = 'unhealthy';
     }
-  }
 
-  private async checkSpotifyHealth(): Promise<boolean> {
-    try {
-      await this.spotify.searchArtists('test', 1);
-      return true;
-    } catch (error) {
-      return false;
-    }
-  }
+    const details = {
+      youtube: youtubeHealth.status === 'fulfilled' ? youtubeHealth.value : { error: youtubeHealth.reason },
+      spotify: spotifyHealth.status === 'fulfilled' ? spotifyHealth.value : { error: spotifyHealth.reason },
+      lastfm: lastfmHealth.status === 'fulfilled' ? lastfmHealth.value : { error: lastfmHealth.reason },
+      genius: geniusHealth.status === 'fulfilled' ? geniusHealth.value : { error: geniusHealth.reason },
+      redis: redisHealth.status === 'fulfilled' ? { status: 'healthy' } : { error: redisHealth.reason }
+    };
 
-  private async checkLastFmHealth(): Promise<boolean> {
-    try {
-      await this.lastfm.searchArtists('test', 1);
-      return true;
-    } catch (error) {
-      return false;
-    }
-  }
+    console.log(`✅ Health check completed. Status: ${globalStatus} (${healthyCount}/${totalServices} services healthy)`);
 
-  private async checkGeniusHealth(): Promise<boolean> {
-    try {
-      return await this.genius.checkAvailability();
-    } catch (error) {
-      return false;
-    }
+    return {
+      status: globalStatus,
+      services,
+      details
+    };
   }
 
   /**
-   * Ferme toutes les connexions
+   * UTILITAIRES PRIVÉS
    */
-  async shutdown(): Promise<void> {
-    console.log('🔌 Shutting down API Orchestrator...');
-    await this.cache.disconnect();
-    console.log('✅ API Orchestrator shutdown complete');
+  private calculateGenreOverlap(genres1: string[], genres2: string[]): number {
+    if (genres1.length === 0 || genres2.length === 0) return 0;
+    
+    const set1 = new Set(genres1.map(g => g.toLowerCase()));
+    const set2 = new Set(genres2.map(g => g.toLowerCase()));
+    const intersection = new Set([...set1].filter(g => set2.has(g)));
+    const union = new Set([...set1, ...set2]);
+    
+    return union.size > 0 ? intersection.size / union.size : 0;
   }
+
+  private calculateAudienceOverlap(popularity1: number, popularity2: number): number {
+    const diff = Math.abs(popularity1 - popularity2);
+    return Math.max(0, 1 - (diff / 100));
+  }
+
+  private calculatePopularityFromLastFm(listeners: number, playcount: number): number {
+    // Convertir les stats Last.fm en score de popularité 0-100
+    const listenerScore = Math.min(100, (listeners / 1000000) * 100); // 1M listeners = 100
+    const playcountScore = Math.min(100, (playcount / 50000000) * 100); // 50M plays = 100
+    
+    return Math.round((listenerScore * 0.6) + (playcountScore * 0.4));
+  }
+}
+
+export function createAPIOrchestrator(): APIOrchestrator {
+  return new APIOrchestrator();
 }
 

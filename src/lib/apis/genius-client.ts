@@ -1,218 +1,134 @@
-// Client pour Genius API
+// Client Genius API - VRAIES APIs COMPLÈTES
+// Documentation: https://docs.genius.com/
 
 import axios, { AxiosInstance } from 'axios';
-import { externalAPIs } from '@/lib/config';
 
-export interface GeniusSearchResponse {
+interface GeniusSearchResponse {
   meta: {
     status: number;
   };
   response: {
     hits: Array<{
-      highlights: any[];
-      index: string;
       type: string;
       result: {
-        annotation_count: number;
-        api_path: string;
-        artist_names: string;
-        full_title: string;
-        header_image_thumbnail_url: string;
-        header_image_url: string;
         id: number;
-        lyrics_owner_id: number;
-        lyrics_state: string;
-        path: string;
-        pyongs_count: number;
-        relationships_index_url: string;
-        release_date_components: {
-          year: number;
-          month: number;
-          day: number;
-        };
-        release_date_for_display: string;
-        song_art_image_thumbnail_url: string;
-        song_art_image_url: string;
-        stats: {
-          unreviewed_annotations: number;
-          concurrents: number;
-          hot: boolean;
-          pageviews: number;
-        };
         title: string;
-        title_with_featured: string;
-        url: string;
         primary_artist: GeniusArtist;
+        stats: {
+          pageviews?: number;
+          hot?: boolean;
+        };
       };
     }>;
   };
 }
 
-export interface GeniusArtist {
-  api_path: string;
-  header_image_url: string;
+interface GeniusArtist {
   id: number;
-  image_url: string;
-  is_meme_verified: boolean;
-  is_verified: boolean;
   name: string;
   url: string;
+  image_url: string;
+  is_verified?: boolean;
   iq?: number;
+  stats?: {
+    followers_count?: number;
+    following_count?: number;
+  };
+  description?: {
+    plain?: string;
+  };
 }
 
-export interface GeniusArtistResponse {
+interface GeniusArtistResponse {
   meta: {
     status: number;
   };
   response: {
-    artist: {
-      alternate_names: string[];
-      api_path: string;
-      description: {
-        dom: {
-          tag: string;
-          children: any[];
-        };
-      };
-      facebook_name: string;
-      followers_count: number;
-      header_image_url: string;
-      id: number;
-      image_url: string;
-      instagram_name: string;
-      is_meme_verified: boolean;
-      is_verified: boolean;
-      name: string;
-      twitter_name: string;
-      url: string;
-      current_user_metadata: {
-        permissions: string[];
-        excluded_permissions: string[];
-        interactions: {
-          following: boolean;
-        };
-      };
-    };
+    artist: GeniusArtist;
   };
 }
 
-export interface GeniusArtistSongsResponse {
+interface GeniusArtistSongsResponse {
   meta: {
     status: number;
   };
   response: {
     songs: Array<{
-      annotation_count: number;
-      api_path: string;
-      artist_names: string;
-      full_title: string;
-      header_image_thumbnail_url: string;
-      header_image_url: string;
       id: number;
-      lyrics_owner_id: number;
-      lyrics_state: string;
-      path: string;
-      pyongs_count: number;
-      release_date_components: {
-        year: number;
-        month: number;
-        day: number;
-      };
-      release_date_for_display: string;
-      song_art_image_thumbnail_url: string;
-      song_art_image_url: string;
-      stats: {
-        unreviewed_annotations: number;
-        concurrents: number;
-        hot: boolean;
-        pageviews: number;
-      };
       title: string;
-      title_with_featured: string;
-      url: string;
-      primary_artist: GeniusArtist;
+      stats: {
+        pageviews?: number;
+        hot?: boolean;
+      };
+      primary_artist: {
+        id: number;
+        name: string;
+      };
     }>;
-    next_page: number | null;
+    next_page?: number;
   };
 }
 
-export interface GeniusArtistData {
-  id: number;
+interface GeniusArtistMetrics {
   name: string;
+  id: number;
+  followers: number;
+  total_pageviews: number;
+  hot_songs_count: number;
+  verified: boolean;
+  popularity_score: number;
   url: string;
-  image_url: string;
-  header_image_url: string;
-  is_verified: boolean;
-  followers_count: number;
-  alternate_names: string[];
-  description: string;
-  social_media: {
-    facebook?: string;
-    instagram?: string;
-    twitter?: string;
-  };
-  song_count: number;
-  popular_songs: Array<{
-    id: number;
-    title: string;
-    url: string;
-    pageviews: number;
-    release_date: string;
-  }>;
 }
 
+/**
+ * CLIENT GENIUS API - IMPLÉMENTATION COMPLÈTE
+ * 
+ * HYPOTHÈSES BASÉES SUR LA DOCUMENTATION OFFICIELLE:
+ * 1. Rate limiting: Non documenté précisément, estimation ~60 req/min
+ * 2. search endpoint retourne hits avec primary_artist
+ * 3. artists/{id} retourne détails complets de l'artiste
+ * 4. artists/{id}/songs retourne chansons avec stats pageviews
+ * 5. Cloudflare peut bloquer certaines requêtes (gestion d'erreurs)
+ * 6. pageviews reflètent la popularité sur Genius
+ */
 export class GeniusClient {
   private client: AxiosInstance;
-  private clientId: string;
-  private clientSecret: string;
-  private accessToken: string | null = null;
   private requestCount: number = 0;
-  private lastRequestTime: number = 0;
+  private lastResetTime: number = Date.now();
+  private readonly RATE_LIMIT = 60; // Estimation: 60 requêtes par minute
+  private readonly CLOUDFLARE_RETRY_DELAY = 2000; // 2 secondes
 
-  constructor(clientId: string, clientSecret: string) {
-    this.clientId = clientId;
-    this.clientSecret = clientSecret;
-
+  constructor() {
     this.client = axios.create({
-      baseURL: externalAPIs.genius.baseURL,
-      timeout: 15000, // Timeout plus long pour Genius
+      baseURL: 'https://api.genius.com',
+      timeout: 30000,
       headers: {
         'Accept': 'application/json',
-        'User-Agent': 'TypeBeat-Research-API/1.0'
+        'User-Agent': 'TypeBeat-Research-API/1.0',
+        'Authorization': `Bearer ${process.env.GENIUS_ACCESS_TOKEN}`
       }
     });
 
-    // Intercepteur pour ajouter l'authentification
-    this.client.interceptors.request.use(async (config) => {
-      await this.checkRateLimit();
-      
-      // Genius utilise Bearer token dans l'header Authorization
-      if (this.accessToken) {
-        config.headers.Authorization = `Bearer ${this.accessToken}`;
-      }
-      
-      return config;
-    });
-
-    // Intercepteur pour gérer les erreurs
+    // Intercepteur pour gérer les erreurs et Cloudflare
     this.client.interceptors.response.use(
-      (response) => response,
+      (response) => {
+        this.trackRequest();
+        return response;
+      },
       async (error) => {
+        // Gestion des erreurs Cloudflare
+        if (error.response?.status === 403 || error.response?.status === 503) {
+          console.warn('⚠️ Genius API blocked by Cloudflare, retrying...');
+          await new Promise(resolve => setTimeout(resolve, this.CLOUDFLARE_RETRY_DELAY));
+          throw new Error('Genius API temporarily unavailable (Cloudflare protection)');
+        }
+        
         if (error.response?.status === 401) {
-          console.error('❌ Genius API authentication failed');
-          throw new Error('Genius API authentication failed');
+          throw new Error('Genius API authentication failed - check access token');
         }
         
         if (error.response?.status === 429) {
-          console.log('⏳ Genius rate limit hit, waiting...');
-          await new Promise(resolve => setTimeout(resolve, 2000));
-          return this.client.request(error.config);
-        }
-
-        // Genius peut être protégé par Cloudflare
-        if (error.response?.status === 403 || error.response?.status === 503) {
-          console.warn('⚠️ Genius API blocked (possibly Cloudflare protection)');
-          throw new Error('Genius API temporarily unavailable');
+          throw new Error('Genius API rate limit exceeded');
         }
         
         throw error;
@@ -221,27 +137,34 @@ export class GeniusClient {
   }
 
   /**
-   * Configure le token d'accès (si disponible)
+   * TRACKING DES REQUÊTES POUR RATE LIMITING
+   * HYPOTHÈSE: Limite estimée à 60 requêtes par minute
    */
-  setAccessToken(token: string): void {
-    this.accessToken = token;
+  private trackRequest(): void {
+    const now = Date.now();
+    
+    // Reset du compteur chaque minute
+    if (now - this.lastResetTime >= 60000) {
+      this.requestCount = 0;
+      this.lastResetTime = now;
+    }
+    
+    this.requestCount++;
+    
+    if (this.requestCount >= this.RATE_LIMIT * 0.8) {
+      console.warn(`⚠️ Approaching Genius rate limit: ${this.requestCount}/${this.RATE_LIMIT}`);
+    }
   }
 
   /**
-   * Recherche d'artistes et de chansons
+   * RECHERCHE D'ARTISTES GENIUS
+   * HYPOTHÈSE: search endpoint retourne des hits avec primary_artist
+   * FORMAT ATTENDU: { response: { hits: [{ result: { primary_artist } }] } }
+   * INFÉRENCE: Filtrage par type "song" pour obtenir les artistes
    */
-  async search(query: string): Promise<{
-    artists: GeniusArtist[];
-    songs: Array<{
-      id: number;
-      title: string;
-      artist: string;
-      url: string;
-      pageviews: number;
-    }>;
-  }> {
+  async searchArtists(query: string): Promise<GeniusArtist[]> {
     try {
-      console.log(`🔍 Searching Genius for: "${query}"`);
+      console.log(`🔍 Genius Search: "${query}"`);
       
       const response = await this.client.get<GeniusSearchResponse>('/search', {
         params: {
@@ -253,285 +176,279 @@ export class GeniusClient {
         throw new Error(`Genius API error: ${response.data.meta.status}`);
       }
 
-      const hits = response.data.response.hits;
-      
-      // Extraire les artistes uniques
+      // Extraire les artistes uniques des résultats
       const artistsMap = new Map<number, GeniusArtist>();
-      const songs: Array<{
-        id: number;
-        title: string;
-        artist: string;
-        url: string;
-        pageviews: number;
-      }> = [];
-
-      hits.forEach(hit => {
-        const result = hit.result;
-        const artist = result.primary_artist;
-        
-        // Ajouter l'artiste s'il n'est pas déjà présent
-        if (!artistsMap.has(artist.id)) {
-          artistsMap.set(artist.id, artist);
+      
+      response.data.response.hits.forEach(hit => {
+        if (hit.result.primary_artist) {
+          const artist = hit.result.primary_artist;
+          if (!artistsMap.has(artist.id)) {
+            artistsMap.set(artist.id, artist);
+          }
         }
-        
-        // Ajouter la chanson
-        songs.push({
-          id: result.id,
-          title: result.title,
-          artist: artist.name,
-          url: result.url,
-          pageviews: result.stats.pageviews || 0
-        });
       });
 
-      const artists = Array.from(artistsMap.values());
+      const uniqueArtists = Array.from(artistsMap.values());
+      console.log(`✅ Found ${uniqueArtists.length} unique artists for "${query}"`);
       
-      console.log(`✅ Found ${artists.length} artists and ${songs.length} songs on Genius`);
-      
-      return { artists, songs };
-
+      return uniqueArtists;
     } catch (error) {
-      console.error(`❌ Genius search error for "${query}":`, error);
-      
-      // Retourner des résultats vides plutôt que de faire échouer
-      if (error instanceof Error && error.message.includes('temporarily unavailable')) {
-        return { artists: [], songs: [] };
-      }
-      
+      console.error(`❌ Genius search failed for "${query}":`, error);
       throw new Error(`Genius search failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
   }
 
   /**
-   * Récupère les détails d'un artiste
+   * OBTENIR LES DÉTAILS D'UN ARTISTE
+   * HYPOTHÈSE: artists/{id} retourne détails complets avec stats
+   * FORMAT ATTENDU: { response: { artist: { stats, description } } }
+   * INFÉRENCE: followers_count peut être absent
    */
-  async getArtist(artistId: number): Promise<GeniusArtistData | null> {
+  async getArtistDetails(artistId: number): Promise<GeniusArtist> {
     try {
-      console.log(`📋 Getting Genius artist details for ID: ${artistId}`);
+      console.log(`📊 Getting Genius details for artist ID: ${artistId}`);
       
-      const [artistResponse, songsResponse] = await Promise.allSettled([
-        this.client.get<GeniusArtistResponse>(`/artists/${artistId}`),
-        this.client.get<GeniusArtistSongsResponse>(`/artists/${artistId}/songs`, {
-          params: {
-            sort: 'popularity',
-            per_page: 10
-          }
-        })
-      ]);
+      const response = await this.client.get<GeniusArtistResponse>(`/artists/${artistId}`);
 
-      if (artistResponse.status === 'rejected') {
-        console.error('❌ Failed to fetch artist details:', artistResponse.reason);
-        return null;
+      if (response.data.meta.status !== 200) {
+        throw new Error(`Genius API error: ${response.data.meta.status}`);
       }
 
-      const artist = artistResponse.value.data.response.artist;
-      const songs = songsResponse.status === 'fulfilled' 
-        ? songsResponse.value.data.response.songs 
-        : [];
-
-      // Extraire la description textuelle
-      const description = this.extractTextFromDescription(artist.description);
-
-      const artistData: GeniusArtistData = {
-        id: artist.id,
-        name: artist.name,
-        url: artist.url,
-        image_url: artist.image_url,
-        header_image_url: artist.header_image_url,
-        is_verified: artist.is_verified,
-        followers_count: artist.followers_count || 0,
-        alternate_names: artist.alternate_names || [],
-        description,
-        social_media: {
-          facebook: artist.facebook_name || undefined,
-          instagram: artist.instagram_name || undefined,
-          twitter: artist.twitter_name || undefined
-        },
-        song_count: songs.length,
-        popular_songs: songs.map(song => ({
-          id: song.id,
-          title: song.title,
-          url: song.url,
-          pageviews: song.stats.pageviews || 0,
-          release_date: song.release_date_for_display || ''
-        }))
-      };
-
-      console.log(`✅ Retrieved Genius artist data for "${artist.name}"`);
-      
-      return artistData;
-
+      console.log(`✅ Retrieved details for artist ${response.data.response.artist.name}`);
+      return response.data.response.artist;
     } catch (error) {
-      console.error(`❌ Genius artist details error for ID ${artistId}:`, error);
-      return null;
+      console.error(`❌ Failed to get Genius details for artist ${artistId}:`, error);
+      throw new Error(`Failed to get artist details: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
   }
 
   /**
-   * Recherche spécifique d'un artiste par nom
+   * OBTENIR LES CHANSONS D'UN ARTISTE AVEC STATISTIQUES
+   * HYPOTHÈSE: artists/{id}/songs retourne chansons avec pageviews
+   * FORMAT ATTENDU: { response: { songs: [{ stats: { pageviews } }] } }
+   * INFÉRENCE: pageviews reflètent la popularité, hot indique tendance
    */
-  async findArtist(artistName: string): Promise<GeniusArtistData | null> {
+  async getArtistSongs(artistId: number, limit: number = 20): Promise<GeniusArtistSongsResponse['response']['songs']> {
     try {
-      const searchResult = await this.search(artistName);
+      console.log(`🎵 Getting songs for artist ID: ${artistId} (${limit} songs)`);
       
-      // Chercher l'artiste avec le nom le plus proche
-      const exactMatch = searchResult.artists.find(artist => 
-        artist.name.toLowerCase() === artistName.toLowerCase()
-      );
-      
-      if (exactMatch) {
-        return await this.getArtist(exactMatch.id);
-      }
-      
-      // Si pas de correspondance exacte, prendre le premier résultat
-      if (searchResult.artists.length > 0) {
-        return await this.getArtist(searchResult.artists[0].id);
-      }
-      
-      return null;
-
-    } catch (error) {
-      console.error(`❌ Genius find artist error for "${artistName}":`, error);
-      return null;
-    }
-  }
-
-  /**
-   * Analyse la popularité d'un artiste basée sur les vues de ses chansons
-   */
-  async analyzeArtistPopularity(artistName: string): Promise<{
-    artist: string;
-    totalPageviews: number;
-    averagePageviews: number;
-    topSongs: Array<{
-      title: string;
-      pageviews: number;
-      url: string;
-    }>;
-    popularityScore: number; // 0-100
-  } | null> {
-    try {
-      const artistData = await this.findArtist(artistName);
-      
-      if (!artistData) {
-        return null;
-      }
-
-      const totalPageviews = artistData.popular_songs.reduce(
-        (sum, song) => sum + song.pageviews, 0
-      );
-      
-      const averagePageviews = artistData.popular_songs.length > 0 
-        ? totalPageviews / artistData.popular_songs.length 
-        : 0;
-
-      const topSongs = artistData.popular_songs
-        .sort((a, b) => b.pageviews - a.pageviews)
-        .slice(0, 5)
-        .map(song => ({
-          title: song.title,
-          pageviews: song.pageviews,
-          url: song.url
-        }));
-
-      // Score de popularité basé sur les vues (logarithmique)
-      const popularityScore = Math.min(
-        100, 
-        Math.log10(Math.max(1, averagePageviews)) * 10
-      );
-
-      return {
-        artist: artistData.name,
-        totalPageviews,
-        averagePageviews: Math.round(averagePageviews),
-        topSongs,
-        popularityScore: Math.round(popularityScore)
-      };
-
-    } catch (error) {
-      console.error(`❌ Genius popularity analysis error for "${artistName}":`, error);
-      return null;
-    }
-  }
-
-  /**
-   * Gère le rate limiting (conservateur pour Genius)
-   */
-  private async checkRateLimit(): Promise<void> {
-    const now = Date.now();
-    const timeSinceLastRequest = now - this.lastRequestTime;
-    
-    // Attendre au moins 500ms entre les requêtes
-    const minInterval = 500;
-    if (timeSinceLastRequest < minInterval) {
-      const waitTime = minInterval - timeSinceLastRequest;
-      console.log(`⏳ Genius rate limiting, waiting ${waitTime}ms`);
-      await new Promise(resolve => setTimeout(resolve, waitTime));
-    }
-    
-    this.requestCount++;
-    this.lastRequestTime = Date.now();
-  }
-
-  /**
-   * Extrait le texte de la description Genius (format DOM)
-   */
-  private extractTextFromDescription(description: any): string {
-    try {
-      if (!description || !description.dom) {
-        return '';
-      }
-      
-      // Fonction récursive pour extraire le texte des nœuds DOM
-      const extractText = (node: any): string => {
-        if (typeof node === 'string') {
-          return node;
+      const response = await this.client.get<GeniusArtistSongsResponse>(`/artists/${artistId}/songs`, {
+        params: {
+          per_page: Math.min(limit, 50), // Limite API Genius
+          sort: 'popularity' // Trier par popularité
         }
-        
-        if (node.children && Array.isArray(node.children)) {
-          return node.children.map(extractText).join(' ');
-        }
-        
-        return '';
-      };
-      
-      return extractText(description.dom).trim();
-      
-    } catch (error) {
-      console.warn('⚠️ Could not extract description text:', error);
-      return '';
-    }
-  }
-
-  /**
-   * Vérifie si l'API Genius est disponible
-   */
-  async checkAvailability(): Promise<boolean> {
-    try {
-      await this.client.get('/search', {
-        params: { q: 'test' },
-        timeout: 5000
       });
-      return true;
+
+      if (response.data.meta.status !== 200) {
+        throw new Error(`Genius API error: ${response.data.meta.status}`);
+      }
+
+      console.log(`✅ Retrieved ${response.data.response.songs.length} songs`);
+      return response.data.response.songs;
     } catch (error) {
-      console.warn('⚠️ Genius API not available:', error);
+      console.error(`❌ Failed to get songs for artist ${artistId}:`, error);
+      throw new Error(`Failed to get artist songs: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  }
+
+  /**
+   * ANALYSER LES MÉTRIQUES COMPLÈTES D'UN ARTISTE
+   * ALGORITHME:
+   * 1. Recherche de l'artiste par nom
+   * 2. Obtention des détails complets
+   * 3. Récupération des chansons populaires
+   * 4. Calcul des métriques agrégées (pageviews totales, hot songs)
+   * 5. Calcul d'un score de popularité composite
+   */
+  async analyzeArtistMetrics(artistName: string): Promise<GeniusArtistMetrics | null> {
+    try {
+      console.log(`🎯 Analyzing Genius metrics for: ${artistName}`);
+      
+      // 1. Rechercher l'artiste
+      const searchResults = await this.searchArtists(artistName);
+      if (searchResults.length === 0) {
+        console.log(`⚠️ Artist "${artistName}" not found on Genius`);
+        return null;
+      }
+
+      // Prendre le premier résultat (plus pertinent)
+      const artist = searchResults[0];
+      
+      // 2. Obtenir les détails complets
+      let detailedArtist: GeniusArtist;
+      try {
+        detailedArtist = await this.getArtistDetails(artist.id);
+      } catch (error) {
+        console.warn(`⚠️ Failed to get detailed info, using search result`);
+        detailedArtist = artist;
+      }
+
+      // 3. Obtenir les chansons populaires
+      let songs: GeniusArtistSongsResponse['response']['songs'] = [];
+      try {
+        songs = await this.getArtistSongs(artist.id, 50);
+      } catch (error) {
+        console.warn(`⚠️ Failed to get songs for ${artistName}`);
+      }
+
+      // 4. Calculer les métriques agrégées
+      const totalPageviews = songs.reduce((sum, song) => {
+        return sum + (song.stats?.pageviews || 0);
+      }, 0);
+
+      const hotSongsCount = songs.filter(song => song.stats?.hot).length;
+
+      // 5. Calculer le score de popularité composite
+      const popularityScore = this.calculatePopularityScore({
+        followers: detailedArtist.stats?.followers_count || 0,
+        totalPageviews,
+        hotSongsCount,
+        songsCount: songs.length,
+        verified: detailedArtist.is_verified || false
+      });
+
+      const metrics: GeniusArtistMetrics = {
+        name: detailedArtist.name,
+        id: detailedArtist.id,
+        followers: detailedArtist.stats?.followers_count || 0,
+        total_pageviews: totalPageviews,
+        hot_songs_count: hotSongsCount,
+        verified: detailedArtist.is_verified || false,
+        popularity_score: popularityScore,
+        url: detailedArtist.url
+      };
+
+      console.log(`✅ Analysis completed for ${artistName}:`, {
+        followers: metrics.followers,
+        pageviews: metrics.total_pageviews,
+        hotSongs: metrics.hot_songs_count,
+        score: metrics.popularity_score
+      });
+
+      return metrics;
+    } catch (error) {
+      console.error(`❌ Failed to analyze ${artistName} on Genius:`, error);
+      
+      // Retourner null au lieu de throw pour permettre le fallback gracieux
+      return null;
+    }
+  }
+
+  /**
+   * CALCUL DU SCORE DE POPULARITÉ GENIUS
+   * ALGORITHME COMPOSITE:
+   * 1. Followers (normalisé sur 100k)
+   * 2. Pageviews totales (normalisé sur 10M)
+   * 3. Ratio de hot songs
+   * 4. Bonus pour artistes vérifiés
+   * 
+   * HYPOTHÈSES:
+   * - 100k followers = très populaire sur Genius
+   * - 10M pageviews = très populaire
+   * - Hot songs indiquent tendance actuelle
+   * - Vérification = légitimité
+   */
+  private calculatePopularityScore(metrics: {
+    followers: number;
+    totalPageviews: number;
+    hotSongsCount: number;
+    songsCount: number;
+    verified: boolean;
+  }): number {
+    const { followers, totalPageviews, hotSongsCount, songsCount, verified } = metrics;
+
+    // Normalisation des métriques (0-1)
+    const followersScore = Math.min(1, followers / 100000); // 100k = score max
+    const pageviewsScore = Math.min(1, totalPageviews / 10000000); // 10M = score max
+    const hotRatio = songsCount > 0 ? hotSongsCount / songsCount : 0;
+    const verifiedBonus = verified ? 0.1 : 0;
+
+    // Score composite (0-10)
+    const score = (
+      followersScore * 3 +
+      pageviewsScore * 4 +
+      hotRatio * 2 +
+      verifiedBonus
+    ) * (10 / 9.1); // Normalisation sur 10
+
+    return Math.min(10, Math.max(0, score));
+  }
+
+  /**
+   * RECHERCHE SIMPLE D'UN ARTISTE AVEC FALLBACK
+   * Méthode simplifiée pour les cas où seules les infos de base sont nécessaires
+   */
+  async findArtist(artistName: string): Promise<GeniusArtist | null> {
+    try {
+      const artists = await this.searchArtists(artistName);
+      return artists.length > 0 ? artists[0] : null;
+    } catch (error) {
+      console.warn(`⚠️ Genius search failed for ${artistName}, returning null`);
+      return null;
+    }
+  }
+
+  /**
+   * HEALTH CHECK AVEC GESTION CLOUDFLARE
+   */
+  async healthCheck(): Promise<{ status: 'healthy' | 'unhealthy'; error?: string; rateLimit?: any; cloudflare_blocked?: boolean }> {
+    try {
+      // Test simple avec une recherche
+      await this.searchArtists('test');
+      
+      return {
+        status: 'healthy',
+        rateLimit: {
+          requestCount: this.requestCount,
+          limit: this.RATE_LIMIT,
+          resetTime: new Date(this.lastResetTime + 60000).toISOString()
+        }
+      };
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      
+      // Distinguer les erreurs Cloudflare des autres
+      const isCloudflareError = errorMessage.includes('Cloudflare') || errorMessage.includes('temporarily unavailable');
+      
+      return {
+        status: 'unhealthy',
+        error: errorMessage,
+        cloudflare_blocked: isCloudflareError
+      };
+    }
+  }
+
+  /**
+   * OBTENIR LES STATISTIQUES D'UTILISATION
+   */
+  getUsageStats(): { requestCount: number; limit: number; resetTime: string } {
+    return {
+      requestCount: this.requestCount,
+      limit: this.RATE_LIMIT,
+      resetTime: new Date(this.lastResetTime + 60000).toISOString()
+    };
+  }
+
+  /**
+   * VÉRIFIER LA DISPONIBILITÉ (SANS COMPTER DANS LE RATE LIMIT)
+   */
+  async isAvailable(): Promise<boolean> {
+    try {
+      // Test très simple sans utiliser de quota
+      const response = await axios.get('https://api.genius.com', {
+        timeout: 5000,
+        headers: {
+          'User-Agent': 'TypeBeat-Research-API/1.0'
+        }
+      });
+      return response.status === 200;
+    } catch (error) {
       return false;
     }
   }
+}
 
-  /**
-   * Obtient les statistiques d'utilisation
-   */
-  getUsageStats(): {
-    requestCount: number;
-    lastRequestTime: number;
-    hasAccessToken: boolean;
-  } {
-    return {
-      requestCount: this.requestCount,
-      lastRequestTime: this.lastRequestTime,
-      hasAccessToken: this.accessToken !== null
-    };
-  }
+export function createGeniusClient(): GeniusClient {
+  return new GeniusClient();
 }
 

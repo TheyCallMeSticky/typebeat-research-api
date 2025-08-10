@@ -594,6 +594,8 @@ export class RedisClient {
 }
 
 export function createRedisClient(): RedisClient {
+
+  console.log(process.env)
   const config: CacheConfig = {
     host: process.env.REDIS_HOST || 'localhost',
     port: parseInt(process.env.REDIS_PORT || '6379'),
