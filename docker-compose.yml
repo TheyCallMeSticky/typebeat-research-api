@@ -1,0 +1,135 @@
+# Docker Compose pour Type Beat Research API
+version: '3.8'
+
+services:
+  # Base de données PostgreSQL
+  postgres:
+    image: postgres:15-alpine
+    container_name: typebeat-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: typebeat_research_dev
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8"
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - typebeat-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Cache Redis
+  redis:
+    image: redis:7-alpine
+    container_name: typebeat-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+      - ./docker/redis/redis.conf:/usr/local/etc/redis/redis.conf
+    command: redis-server /usr/local/etc/redis/redis.conf
+    networks:
+      - typebeat-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # API Next.js (optionnel pour développement)
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: typebeat-api
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - DATABASE_URL=postgresql://postgres:password@postgres:5432/typebeat_research_dev
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - typebeat-network
+    volumes:
+      - .:/app
+      - /app/node_modules
+      - /app/.next
+
+  # Adminer pour gestion base de données (développement)
+  adminer:
+    image: adminer:latest
+    container_name: typebeat-adminer
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      ADMINER_DEFAULT_SERVER: postgres
+    depends_on:
+      - postgres
+    networks:
+      - typebeat-network
+    profiles:
+      - dev
+
+  # Redis Commander pour gestion cache (développement)
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: typebeat-redis-commander
+    restart: unless-stopped
+    ports:
+      - "8081:8081"
+    environment:
+      REDIS_HOSTS: local:redis:6379
+    depends_on:
+      - redis
+    networks:
+      - typebeat-network
+    profiles:
+      - dev
+
+# Volumes persistants
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+
+# Réseau interne
+networks:
+  typebeat-network:
+    driver: bridge
+
+# Commandes utiles :
+# 
+# Démarrer les services de base :
+# docker-compose up -d postgres redis
+#
+# Démarrer avec outils de développement :
+# docker-compose --profile dev up -d
+#
+# Démarrer tout (y compris l'API) :
+# docker-compose up -d
+#
+# Voir les logs :
+# docker-compose logs -f
+#
+# Arrêter tous les services :
+# docker-compose down
+#
+# Nettoyer les volumes :
+# docker-compose down -v
+

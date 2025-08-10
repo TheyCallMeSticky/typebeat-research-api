@@ -1,0 +1,41 @@
+{
+  "name": "typebeat-research-api",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev -p ${PORT:-3002}",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "type-check": "tsc --noEmit",
+    "test": "echo \"Tests à implémenter\" && exit 0",
+    "db:migrate": "echo \"Migrations à implémenter\" && exit 0",
+    "cache:clear": "echo \"Cache clearing à implémenter\" && exit 0"
+  },
+  "dependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/ioredis": "^4.28.10",
+    "@types/pg": "^8.15.5",
+    "axios": "^1.11.0",
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.1",
+    "ioredis": "^5.7.0",
+    "next": "15.4.6",
+    "pg": "^8.16.3",
+    "react": "19.1.0",
+    "react-dom": "19.1.0",
+    "redis": "^5.8.0"
+  },
+  "devDependencies": {
+    "@eslint/eslintrc": "^3",
+    "@tailwindcss/postcss": "^4",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "eslint": "^9",
+    "eslint-config-next": "15.4.6",
+    "tailwindcss": "^4",
+    "typescript": "^5"
+  },
+  "packageManager": "pnpm@9.15.9+sha512.68046141893c66fad01c079231128e9afb89ef87e2691d69e4d40eee228988295fd4682181bae55b58418c3a253bde65a505ec7c5f9403ece5cc3cd37dcf2531"
+}

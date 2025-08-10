@@ -1,0 +1,56 @@
+# Dockerfile pour TypeBeat Research API (Production)
+FROM node:20-alpine AS base
+
+# Installer les dépendances système
+RUN apk add --no-cache \
+    curl \
+    bash \
+    libc6-compat
+
+WORKDIR /app
+
+# Installer pnpm
+RUN npm install -g pnpm
+
+# ===== DEPENDENCIES =====
+FROM base AS deps
+COPY package*.json pnpm-lock.yaml* ./
+RUN pnpm install --frozen-lockfile
+
+# ===== BUILDER =====
+FROM base AS builder
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+
+# Désactiver la télémétrie Next.js
+ENV NEXT_TELEMETRY_DISABLED 1
+
+# Build de l'application
+RUN pnpm build
+
+# ===== RUNNER =====
+FROM base AS runner
+WORKDIR /app
+
+ENV NODE_ENV production
+ENV NEXT_TELEMETRY_DISABLED 1
+
+# Créer un utilisateur non-root
+RUN addgroup --system --gid 1001 nodejs
+RUN adduser --system --uid 1001 nextjs
+
+# Copier les fichiers nécessaires depuis le builder
+COPY --from=builder /app/public ./public
+COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
+COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
+
+USER nextjs
+
+EXPOSE 3002
+
+ENV PORT 3002
+ENV HOSTNAME "0.0.0.0"
+
+# Commande de démarrage
+CMD ["node", "server.js"]
+
